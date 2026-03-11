@@ -44,7 +44,7 @@ export default function App() {
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     const file = e.dataTransfer.files[0];
-    if (file?.type === 'application/pdf') handleFileUpload(file);
+    if (file) handleFileUpload(file);
   }, [handleFileUpload]);
 
   const handleRoomUpdate = useCallback(async (roomId: string, update: Partial<Room>) => {
@@ -71,7 +71,7 @@ export default function App() {
       >
         <div className="text-center space-y-5">
           <h1 className="text-2xl font-bold text-neutral-200">Floorplan Processor</h1>
-          <p className="text-neutral-500">Drop a PDF floorplan or click to upload</p>
+          <p className="text-neutral-500">Drop a floorplan (PDF, PNG, JPG) or click to upload</p>
           <div className="flex items-center justify-center gap-3">
             <span className={`text-xs ${mode === 'hybrid' ? 'text-neutral-200' : 'text-neutral-600'}`}>CV + AI</span>
             <button
@@ -92,10 +92,10 @@ export default function App() {
               : 'CV boundaries + basic Gemini labelling'}
           </p>
           <label className="inline-block px-6 py-3 bg-sky-600 text-white rounded-lg cursor-pointer hover:bg-sky-500">
-            Select PDF
+            Select File
             <input
               type="file"
-              accept=".pdf"
+              accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0];

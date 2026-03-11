@@ -16,7 +16,7 @@ from shapely.validation import make_valid
 
 from backend.database import Database
 from backend.models.room import ExcludedRegion, ProjectData, RoomData, to_real_measurements
-from backend.pipeline.extractor import extract_floorplan
+from backend.pipeline.extractor import extract_floorplan, extract_from_image, IMAGE_EXTENSIONS
 from backend.pipeline.preprocessor import preprocess_image, detect_margin_regions
 from backend.pipeline.color_segmenter import segment_rooms_by_color, merge_room_lists
 from backend.pipeline.room_segmenter import segment_rooms
@@ -101,9 +101,10 @@ async def process_pdf(
     manual_px_per_meter: Optional[float] = Form(None),
     mode: str = Form("hybrid"),
 ):
-    """Upload a PDF, run the pipeline, persist results, and return them.
+    """Upload a PDF or image, run the pipeline, persist results, and return them.
 
     mode: "hybrid" (CV + Gemini labelling) or "gemini" (pure Gemini extraction)
+    Supported formats: PDF, PNG, JPG, JPEG, TIFF, BMP, WebP
     """
     # Save upload to temp file
     suffix = os.path.splitext(file.filename or "upload.pdf")[1] or ".pdf"
@@ -112,10 +113,22 @@ async def process_pdf(
         tmp_path = tmp.name
 
     try:
-        # 1. Extract image from PDF
-        extraction = extract_floorplan(tmp_path, page_num=page_num)
+        # 1. Extract image from PDF or image file
+        if suffix.lower() in IMAGE_EXTENSIONS:
+            extraction = extract_from_image(tmp_path)
+        else:
+            extraction = extract_floorplan(tmp_path, page_num=page_num)
         image: np.ndarray = extraction["image"]
         img_h, img_w = image.shape[:2]
+
+        # Cap max dimension to 5000px for tractable processing
+        MAX_DIM = 5000
+        if max(img_h, img_w) > MAX_DIM:
+            scale_factor = MAX_DIM / max(img_h, img_w)
+            new_w = int(img_w * scale_factor)
+            new_h = int(img_h * scale_factor)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            img_h, img_w = new_h, new_w
 
         # 2. Detect scale from text
         scale_result = detect_scale(
