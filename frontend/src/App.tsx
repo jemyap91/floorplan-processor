@@ -4,7 +4,7 @@ import { RoomSidebar } from './components/RoomSidebar';
 import { RoomDetail } from './components/RoomDetail';
 import {
   processFloorplan, updateRoom, deleteRoom, getImageUrl,
-  type Room, type ProcessResult,
+  type Room, type ProcessResult, type ProcessMode,
 } from './api';
 
 type AppState = 'idle' | 'processing' | 'ready' | 'error';
@@ -17,6 +17,7 @@ export default function App() {
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
   const [scale, setScale] = useState<ProcessResult['scale'] | null>(null);
   const [progress, setProgress] = useState('');
+  const [mode, setMode] = useState<ProcessMode>('gemini');
 
   const selectedRoom = rooms.find((r) => r.id === selectedRoomId) || null;
   const imageUrl = projectId ? getImageUrl(projectId) : null;
@@ -24,9 +25,12 @@ export default function App() {
   const handleFileUpload = useCallback(async (file: File) => {
     setState('processing');
     setError(null);
-    setProgress('Uploading and processing...');
+    setProgress(mode === 'gemini'
+      ? 'Sending to Gemini for room extraction...'
+      : 'Processing with CV + Gemini pipeline...',
+    );
     try {
-      const result = await processFloorplan(file);
+      const result = await processFloorplan(file, 0, mode);
       setProjectId(result.project_id);
       setRooms(result.rooms);
       setScale(result.scale);
@@ -35,7 +39,7 @@ export default function App() {
       setError(err.message || 'Processing failed');
       setState('error');
     }
-  }, []);
+  }, [mode]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -65,9 +69,28 @@ export default function App() {
         onDrop={handleDrop}
         onDragOver={(e) => e.preventDefault()}
       >
-        <div className="text-center space-y-4">
+        <div className="text-center space-y-5">
           <h1 className="text-2xl font-bold text-neutral-200">Floorplan Processor</h1>
           <p className="text-neutral-500">Drop a PDF floorplan or click to upload</p>
+          <div className="flex items-center justify-center gap-3">
+            <span className={`text-xs ${mode === 'hybrid' ? 'text-neutral-200' : 'text-neutral-600'}`}>CV + AI</span>
+            <button
+              onClick={() => setMode(mode === 'hybrid' ? 'gemini' : 'hybrid')}
+              className={`relative w-11 h-6 rounded-full transition-colors shrink-0 ${
+                mode === 'gemini' ? 'bg-violet-600' : 'bg-neutral-700'
+              }`}
+            >
+              <span className={`block w-4 h-4 rounded-full bg-white absolute top-1 transition-all ${
+                mode === 'gemini' ? 'left-6' : 'left-1'
+              }`} />
+            </button>
+            <span className={`text-xs ${mode === 'gemini' ? 'text-neutral-200' : 'text-neutral-600'}`}>Gemini AI</span>
+          </div>
+          <p className="text-neutral-600 text-xs">
+            {mode === 'gemini'
+              ? 'CV boundaries + Gemini room labelling (recommended)'
+              : 'CV boundaries + basic Gemini labelling'}
+          </p>
           <label className="inline-block px-6 py-3 bg-sky-600 text-white rounded-lg cursor-pointer hover:bg-sky-500">
             Select PDF
             <input
@@ -104,6 +127,7 @@ export default function App() {
         selectedRoomId={selectedRoomId}
         onRoomSelect={setSelectedRoomId}
         scale={scale}
+        projectId={projectId}
       />
       <FloorplanCanvas
         rooms={rooms}

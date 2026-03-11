@@ -10,10 +10,10 @@ interface FloorplanCanvasProps {
 }
 
 export function FloorplanCanvas(props: FloorplanCanvasProps) {
-  const { canvasRef, fitToView } = useFloorplanCanvas(props);
+  const { containerRef, canvasRef, fitToView } = useFloorplanCanvas(props);
 
   return (
-    <div className="relative flex-1 bg-neutral-900 overflow-hidden">
+    <div ref={containerRef} className="relative flex-1 min-w-0 bg-neutral-900 overflow-hidden">
       <div className="absolute top-3 left-3 z-10 flex gap-1">
         <button
           onClick={fitToView}

@@ -18,16 +18,29 @@ interface UseFloorplanCanvasOptions {
 export function useFloorplanCanvas({
   rooms, imageUrl, selectedRoomId, onRoomSelect, onRoomUpdate,
 }: UseFloorplanCanvasOptions) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fabricRef = useRef<Canvas | null>(null);
   const [isReady, setIsReady] = useState(false);
 
   useEffect(() => {
-    if (!canvasRef.current) return;
+    if (!canvasRef.current || !containerRef.current) return;
+    const container = containerRef.current;
     const canvas = new Canvas(canvasRef.current, {
       selection: false,
       backgroundColor: '#111',
+      width: container.clientWidth,
+      height: container.clientHeight,
     });
+
+    const resizeObserver = new ResizeObserver(() => {
+      canvas.setDimensions({
+        width: container.clientWidth,
+        height: container.clientHeight,
+      });
+      canvas.requestRenderAll();
+    });
+    resizeObserver.observe(container);
 
     let isPanning = false;
     let lastPosX = 0;
@@ -71,6 +84,7 @@ export function useFloorplanCanvas({
     setIsReady(true);
 
     return () => {
+      resizeObserver.disconnect();
       canvas.dispose();
       fabricRef.current = null;
     };
@@ -80,19 +94,24 @@ export function useFloorplanCanvas({
     const canvas = fabricRef.current;
     if (!canvas || !imageUrl) return;
 
-    FabricImage.fromURL(imageUrl).then((img) => {
-      canvas.setDimensions({
-        width: canvas.getElement().parentElement?.clientWidth || 800,
-        height: canvas.getElement().parentElement?.clientHeight || 600,
-      });
+    FabricImage.fromURL(imageUrl, { crossOrigin: 'anonymous' }).then((img) => {
+      if (!img || !img.width) {
+        console.error('Failed to load floorplan image');
+        return;
+      }
       img.set({ selectable: false, evented: false });
       canvas.backgroundImage = img;
-      const scaleX = (canvas.width ?? 800) / (img.width || 1);
-      const scaleY = (canvas.height ?? 600) / (img.height || 1);
-      const scale = Math.min(scaleX, scaleY);
-      canvas.setZoom(scale);
+
+      const cw = canvas.width ?? 800;
+      const ch = canvas.height ?? 600;
+      const iw = img.width || 1;
+      const ih = img.height || 1;
+      const scale = Math.min(cw / iw, ch / ih) * 0.95;
+      const offsetX = (cw - iw * scale) / 2;
+      const offsetY = (ch - ih * scale) / 2;
+      canvas.viewportTransform = [scale, 0, 0, scale, offsetX, offsetY];
       canvas.requestRenderAll();
-    });
+    }).catch((err) => console.error('Image load error:', err));
   }, [imageUrl, isReady]);
 
   useEffect(() => {
@@ -109,9 +128,10 @@ export function useFloorplanCanvas({
       const isSelected = room.id === selectedRoomId;
 
       const polygon = new Polygon(points, {
-        fill: isSelected ? color + '40' : color + '20',
-        stroke: color,
-        strokeWidth: isSelected ? 3 : 1.5,
+        fill: isSelected ? '#facc1550' : color + '20',
+        stroke: isSelected ? '#facc15' : color,
+        strokeWidth: isSelected ? 3 : 1,
+        strokeDashArray: isSelected ? [8, 4] : undefined,
         selectable: false,
         data: { type: 'room', roomId: room.id },
       });
@@ -121,8 +141,9 @@ export function useFloorplanCanvas({
       const label = new FabricText(room.name || 'Unnamed', {
         left: room.centroid[0],
         top: room.centroid[1],
-        fontSize: 12,
-        fill: color,
+        fontSize: isSelected ? 14 : 12,
+        fill: isSelected ? '#facc15' : color,
+        fontWeight: isSelected ? 'bold' : 'normal',
         fontFamily: 'monospace',
         selectable: false,
         evented: false,
@@ -137,12 +158,16 @@ export function useFloorplanCanvas({
     const canvas = fabricRef.current;
     if (!canvas || !canvas.backgroundImage) return;
     const img = canvas.backgroundImage as FabricImage;
-    const scaleX = (canvas.width ?? 800) / (img.width || 1);
-    const scaleY = (canvas.height ?? 600) / (img.height || 1);
-    canvas.setZoom(Math.min(scaleX, scaleY));
-    canvas.viewportTransform = [canvas.getZoom(), 0, 0, canvas.getZoom(), 0, 0];
+    const cw = canvas.width ?? 800;
+    const ch = canvas.height ?? 600;
+    const iw = img.width || 1;
+    const ih = img.height || 1;
+    const scale = Math.min(cw / iw, ch / ih) * 0.95;
+    const offsetX = (cw - iw * scale) / 2;
+    const offsetY = (ch - ih * scale) / 2;
+    canvas.viewportTransform = [scale, 0, 0, scale, offsetX, offsetY];
     canvas.requestRenderAll();
   }, []);
 
-  return { canvasRef, fitToView };
+  return { containerRef, canvasRef, fitToView };
 }

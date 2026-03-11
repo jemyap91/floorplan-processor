@@ -5,6 +5,7 @@ import tempfile
 import csv
 from typing import Optional
 
+import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,10 +17,11 @@ from shapely.validation import make_valid
 from backend.database import Database
 from backend.models.room import ExcludedRegion, ProjectData, RoomData, to_real_measurements
 from backend.pipeline.extractor import extract_floorplan
-from backend.pipeline.preprocessor import preprocess_image
+from backend.pipeline.preprocessor import preprocess_image, detect_margin_regions
+from backend.pipeline.color_segmenter import segment_rooms_by_color, merge_room_lists
 from backend.pipeline.room_segmenter import segment_rooms
 from backend.pipeline.scale_detector import detect_scale
-from backend.pipeline.vision_ai import classify_regions, label_rooms
+from backend.pipeline.vision_ai import classify_regions, match_gemini_labels_to_cv_rooms, label_rooms
 from backend.pipeline.wall_detector import detect_walls
 
 # ---------------------------------------------------------------------------
@@ -97,8 +99,12 @@ async def process_pdf(
     file: UploadFile = File(...),
     page_num: int = Form(0),
     manual_px_per_meter: Optional[float] = Form(None),
+    mode: str = Form("hybrid"),
 ):
-    """Upload a PDF, run the full pipeline, persist results, and return them."""
+    """Upload a PDF, run the pipeline, persist results, and return them.
+
+    mode: "hybrid" (CV + Gemini labelling) or "gemini" (pure Gemini extraction)
+    """
     # Save upload to temp file
     suffix = os.path.splitext(file.filename or "upload.pdf")[1] or ".pdf"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -106,11 +112,12 @@ async def process_pdf(
         tmp_path = tmp.name
 
     try:
-        # 1. Extract
+        # 1. Extract image from PDF
         extraction = extract_floorplan(tmp_path, page_num=page_num)
         image: np.ndarray = extraction["image"]
+        img_h, img_w = image.shape[:2]
 
-        # 2. Detect scale
+        # 2. Detect scale from text
         scale_result = detect_scale(
             text=extraction["text"],
             image=image,
@@ -122,36 +129,7 @@ async def process_pdf(
             px_per_meter = scale_result.get("px_per_meter")
             scale_source = scale_result.get("source", "auto")
 
-        # 3. Classify regions (Gemini — may fall back to full-image)
-        region_result = classify_regions(image)
-        excluded_regions_raw = region_result.get("excluded_regions", [])
-
-        # 4. Preprocess
-        prep = preprocess_image(image)
-        binary: np.ndarray = prep["binary"]
-
-        # 5. Mask excluded regions from binary BEFORE wall detection
-        excluded_bboxes = []
-        for er in excluded_regions_raw:
-            rx = int(er.get("x", 0))
-            ry = int(er.get("y", 0))
-            rw = int(er.get("width", 0))
-            rh = int(er.get("height", 0))
-            binary[ry : ry + rh, rx : rx + rw] = 0
-            excluded_bboxes.append((rx, ry, rw, rh))
-
-        # 6. Detect walls
-        wall_result = detect_walls(binary)
-
-        # 7. Segment rooms
-        raw_rooms = segment_rooms(
-            wall_result["wall_mask"], excluded_regions=excluded_bboxes
-        )
-
-        # 8. Label rooms with vision AI
-        labeled = label_rooms(image, raw_rooms)
-
-        # 9. Build project
+        # Build project
         project_name = os.path.splitext(os.path.basename(file.filename or "upload.pdf"))[0]
         project = ProjectData(
             name=project_name,
@@ -159,54 +137,13 @@ async def process_pdf(
             scale_px_per_meter=px_per_meter,
             scale_source=scale_source,
         )
-
         db = get_db()
         db.save_project(project)
 
-        # 10. Save excluded regions
-        for er, bbox in zip(excluded_regions_raw, excluded_bboxes):
-            excl = ExcludedRegion(
-                project_id=project.id,
-                region_type=er.get("type", "table"),
-                bbox=list(bbox),
-            )
-            db.save_excluded_region(excl)
-
-        # 11. Build and save rooms
-        rooms_out = []
-        for i, raw in enumerate(raw_rooms):
-            label_info = labeled[i] if i < len(labeled) else {}
-
-            # Convert Shapely polygon exterior coords to [[x,y], ...]
-            poly: Polygon = raw["polygon"]
-            polygon_coords = [[x, y] for x, y in list(poly.exterior.coords)]
-
-            real = {}
-            if px_per_meter:
-                real = to_real_measurements(
-                    raw["area_px"],
-                    raw["perimeter_px"],
-                    raw["boundary_lengths_px"],
-                    px_per_meter,
-                )
-
-            room = RoomData(
-                project_id=project.id,
-                name=label_info.get("name", "Unnamed"),
-                room_type=label_info.get("type", "unknown"),
-                boundary_polygon=polygon_coords,
-                area_px=raw["area_px"],
-                perimeter_px=raw["perimeter_px"],
-                centroid=raw["centroid"],
-                boundary_lengths_px=raw["boundary_lengths_px"],
-                area_sqm=real.get("area_sqm"),
-                perimeter_m=real.get("perimeter_m"),
-                boundary_lengths_m=real.get("boundary_lengths_m"),
-                source="cv",
-                confidence=float(label_info.get("confidence", 0.0)),
-            )
-            db.save_room(room)
-            rooms_out.append(room.model_dump())
+        if mode == "gemini":
+            rooms_out = _process_gemini_mode(image, project, px_per_meter, db)
+        else:
+            rooms_out = _process_hybrid_mode(image, project, px_per_meter, db)
 
         # Cache the extracted image for later serving
         _image_cache[project.id] = image
@@ -221,6 +158,210 @@ async def process_pdf(
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _process_gemini_mode(
+    image: np.ndarray,
+    project: ProjectData,
+    px_per_meter: Optional[float],
+    db: Database,
+) -> list[dict]:
+    """Gemini-enhanced pipeline — CV detects boundaries, Gemini labels rooms.
+
+    Uses the same CV wall/room detection as hybrid mode, but replaces the
+    basic Gemini labelling with a smarter approach: annotates the image with
+    numbered centroids and asks Gemini to match room names to numbers.
+    This gives precise CV boundaries with accurate Gemini labels.
+    """
+    # 1. Classify regions to exclude title block etc.
+    region_result = classify_regions(image)
+    excluded_regions_raw = region_result.get("excluded_regions", [])
+
+    # 2. Build excluded bboxes
+    excluded_bboxes = []
+    for er in excluded_regions_raw:
+        rx = int(er.get("x", 0))
+        ry = int(er.get("y", 0))
+        rw = int(er.get("width", 0))
+        rh = int(er.get("height", 0))
+        excluded_bboxes.append((rx, ry, rw, rh))
+
+    # 3. Color-based room detection (primary — finds colored zone rooms)
+    color_rooms = segment_rooms_by_color(image, excluded_regions=excluded_bboxes)
+
+    # 4. Wall-based detection for unfilled rooms (corridors, lift shafts)
+    prep = preprocess_image(image)
+    binary: np.ndarray = prep["binary"]
+    for rx, ry, rw, rh in excluded_bboxes:
+        binary[ry : ry + rh, rx : rx + rw] = 0
+    margin_regions = detect_margin_regions(binary)
+    for rx, ry, rw, rh in margin_regions:
+        binary[ry : ry + rh, rx : rx + rw] = 0
+        excluded_bboxes.append((rx, ry, rw, rh))
+
+    # Mask out color-detected rooms so wall detector focuses on unfilled gaps
+    for cr in color_rooms:
+        poly = cr["polygon"]
+        pts = np.array(list(poly.exterior.coords), dtype=np.int32)
+        cv2.fillPoly(binary, [pts], 0)
+
+    wall_result = detect_walls(binary)
+    wall_rooms = segment_rooms(
+        wall_result["wall_mask"], excluded_regions=excluded_bboxes
+    )
+
+    # 5. Merge color + wall rooms
+    raw_rooms = merge_room_lists(color_rooms, wall_rooms)
+
+    # 6. Label rooms by annotating image with numbered centroids
+    labeled = match_gemini_labels_to_cv_rooms([], raw_rooms, image)
+
+    # 6. Save excluded regions
+    for er, bbox in zip(excluded_regions_raw, excluded_bboxes):
+        excl = ExcludedRegion(
+            project_id=project.id,
+            region_type=er.get("type", "table"),
+            bbox=list(bbox),
+        )
+        db.save_excluded_region(excl)
+
+    # 7. Build and save rooms, filtering out NOT_A_ROOM entries
+    rooms_out = []
+    for i, raw in enumerate(raw_rooms):
+        label_info = labeled[i] if i < len(labeled) else {}
+        name = label_info.get("name", "Unnamed")
+
+        # Skip regions Gemini identified as not real rooms
+        if name == "NOT_A_ROOM":
+            continue
+
+        poly: Polygon = raw["polygon"]
+        polygon_coords = [[x, y] for x, y in list(poly.exterior.coords)]
+
+        real = {}
+        if px_per_meter:
+            real = to_real_measurements(
+                raw["area_px"],
+                raw["perimeter_px"],
+                raw["boundary_lengths_px"],
+                px_per_meter,
+            )
+
+        # Sample fill color from image at centroid
+        fill_color = _sample_fill_color(image, raw["centroid"], raw["polygon"])
+
+        room = RoomData(
+            project_id=project.id,
+            name=name,
+            room_type=label_info.get("type", "unknown"),
+            boundary_polygon=polygon_coords,
+            area_px=raw["area_px"],
+            perimeter_px=raw["perimeter_px"],
+            centroid=raw["centroid"],
+            boundary_lengths_px=raw["boundary_lengths_px"],
+            area_sqm=real.get("area_sqm"),
+            perimeter_m=real.get("perimeter_m"),
+            boundary_lengths_m=real.get("boundary_lengths_m"),
+            fill_color_rgb=fill_color,
+            source="gemini",
+            confidence=float(label_info.get("confidence", 0.0)),
+        )
+        db.save_room(room)
+        rooms_out.append(room.model_dump())
+
+    return rooms_out
+
+
+def _process_hybrid_mode(
+    image: np.ndarray,
+    project: ProjectData,
+    px_per_meter: Optional[float],
+    db: Database,
+) -> list[dict]:
+    """Hybrid CV + Gemini pipeline — walls detected by CV, rooms labelled by Gemini."""
+    # 3. Classify regions (Gemini — may fall back to full-image)
+    region_result = classify_regions(image)
+    excluded_regions_raw = region_result.get("excluded_regions", [])
+
+    # 4. Preprocess
+    prep = preprocess_image(image)
+    binary: np.ndarray = prep["binary"]
+
+    # 5. Mask excluded regions from binary BEFORE wall detection
+    excluded_bboxes = []
+    for er in excluded_regions_raw:
+        rx = int(er.get("x", 0))
+        ry = int(er.get("y", 0))
+        rw = int(er.get("width", 0))
+        rh = int(er.get("height", 0))
+        binary[ry : ry + rh, rx : rx + rw] = 0
+        excluded_bboxes.append((rx, ry, rw, rh))
+
+    # 5b. CV-based margin detection (catches dense edge regions)
+    margin_regions = detect_margin_regions(binary)
+    for rx, ry, rw, rh in margin_regions:
+        binary[ry : ry + rh, rx : rx + rw] = 0
+        excluded_bboxes.append((rx, ry, rw, rh))
+
+    # 6. Detect walls
+    wall_result = detect_walls(binary)
+
+    # 7. Segment rooms
+    raw_rooms = segment_rooms(
+        wall_result["wall_mask"], excluded_regions=excluded_bboxes
+    )
+
+    # 8. Label rooms with vision AI
+    labeled = label_rooms(image, raw_rooms)
+
+    # 9. Save excluded regions
+    for er, bbox in zip(excluded_regions_raw, excluded_bboxes):
+        excl = ExcludedRegion(
+            project_id=project.id,
+            region_type=er.get("type", "table"),
+            bbox=list(bbox),
+        )
+        db.save_excluded_region(excl)
+
+    # 10. Build and save rooms
+    rooms_out = []
+    for i, raw in enumerate(raw_rooms):
+        label_info = labeled[i] if i < len(labeled) else {}
+
+        poly: Polygon = raw["polygon"]
+        polygon_coords = [[x, y] for x, y in list(poly.exterior.coords)]
+
+        real = {}
+        if px_per_meter:
+            real = to_real_measurements(
+                raw["area_px"],
+                raw["perimeter_px"],
+                raw["boundary_lengths_px"],
+                px_per_meter,
+            )
+
+        fill_color = _sample_fill_color(image, raw["centroid"], raw["polygon"])
+
+        room = RoomData(
+            project_id=project.id,
+            name=label_info.get("name", "Unnamed"),
+            room_type=label_info.get("type", "unknown"),
+            boundary_polygon=polygon_coords,
+            area_px=raw["area_px"],
+            perimeter_px=raw["perimeter_px"],
+            centroid=raw["centroid"],
+            boundary_lengths_px=raw["boundary_lengths_px"],
+            area_sqm=real.get("area_sqm"),
+            perimeter_m=real.get("perimeter_m"),
+            boundary_lengths_m=real.get("boundary_lengths_m"),
+            fill_color_rgb=fill_color,
+            source="cv",
+            confidence=float(label_info.get("confidence", 0.0)),
+        )
+        db.save_room(room)
+        rooms_out.append(room.model_dump())
+
+    return rooms_out
 
 
 # --- Rooms ------------------------------------------------------------------
@@ -349,10 +490,10 @@ def get_image(project_id: str):
     image = _image_cache[project_id]
     # Convert RGB -> BGR for OpenCV encoding
     bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    success, buf = cv2.imencode(".png", bgr)
+    success, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     if not success:
         raise HTTPException(status_code=500, detail="Failed to encode image")
-    return Response(content=buf.tobytes(), media_type="image/png")
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 
 # --- Export -----------------------------------------------------------------
@@ -410,6 +551,17 @@ def export_project(project_id: str, format: str = "json"):
             },
         )
 
+    if format == "xlsx":
+        from backend.export import build_excel
+
+        xlsx_bytes = build_excel(project, rooms)
+        filename = (project.name or project_id).replace(" ", "_") + ".xlsx"
+        return Response(
+            content=xlsx_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     # Default: JSON
     return {
         "project": project.model_dump(),
@@ -420,6 +572,41 @@ def export_project(project_id: str, format: str = "json"):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _sample_fill_color(
+    image: np.ndarray,
+    centroid: tuple[float, float],
+    polygon,
+) -> list[int] | None:
+    """Sample the median fill color from the image within a room polygon."""
+    h, w = image.shape[:2]
+    cx, cy = int(centroid[0]), int(centroid[1])
+    cx = max(0, min(cx, w - 1))
+    cy = max(0, min(cy, h - 1))
+
+    # Sample a small region around the centroid (faster than masking full polygon)
+    radius = 15
+    y1 = max(0, cy - radius)
+    y2 = min(h, cy + radius)
+    x1 = max(0, cx - radius)
+    x2 = min(w, cx + radius)
+    patch = image[y1:y2, x1:x2]
+
+    if patch.size == 0:
+        return None
+
+    # Filter to non-dark, non-white pixels (the fill color)
+    r, g, b = patch[:, :, 0], patch[:, :, 1], patch[:, :, 2]
+    brightness = (r.astype(int) + g.astype(int) + b.astype(int)) // 3
+    mask = (brightness > 50) & (brightness < 245)
+    colored_pixels = patch[mask]
+
+    if len(colored_pixels) == 0:
+        return [int(image[cy, cx, 0]), int(image[cy, cx, 1]), int(image[cy, cx, 2])]
+
+    median = np.median(colored_pixels, axis=0).astype(int)
+    return [int(median[0]), int(median[1]), int(median[2])]
 
 
 def _get_room_by_id(db: Database, room_id: str) -> Optional[RoomData]:

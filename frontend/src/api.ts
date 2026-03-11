@@ -23,9 +23,12 @@ export interface ProcessResult {
   image_size: { width: number; height: number };
 }
 
-export async function processFloorplan(file: File, pageNum = 0): Promise<ProcessResult> {
+export type ProcessMode = 'hybrid' | 'gemini';
+
+export async function processFloorplan(file: File, pageNum = 0, mode: ProcessMode = 'hybrid'): Promise<ProcessResult> {
   const formData = new FormData();
   formData.append('file', file);
+  formData.append('mode', mode);
   const { data } = await api.post(`/process?page_num=${pageNum}`, formData);
   return data;
 }
@@ -55,7 +58,22 @@ export async function updateScale(projectId: string, pxPerMeter: number) {
   return data;
 }
 
-export async function exportData(projectId: string, format: 'json' | 'csv') {
+export async function exportData(projectId: string, format: 'json' | 'csv' | 'xlsx') {
+  if (format === 'xlsx') {
+    const response = await api.get(`/export/${projectId}?format=xlsx`, {
+      responseType: 'blob',
+    });
+    const blob = new Blob([response.data], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `floorplan-export.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
+    return;
+  }
   const { data } = await api.get(`/export/${projectId}?format=${format}`);
   return data;
 }

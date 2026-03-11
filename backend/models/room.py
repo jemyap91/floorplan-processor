@@ -17,6 +17,7 @@ class RoomData(BaseModel):
     boundary_lengths_px: list[float] = []
     boundary_lengths_m: Optional[list[float]] = None
     centroid: tuple[float, float] = (0.0, 0.0)
+    fill_color_rgb: list[int] | None = None
     source: str = "cv"
     confidence: float = 0.0
 

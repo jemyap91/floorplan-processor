@@ -11,6 +11,17 @@ class Database:
 
     def _create_tables(self):
         self.conn.executescript("""
+            -- Migrate: add fill_color_rgb if missing
+            -- (SQLite ignores ADD COLUMN if it already exists via IF NOT EXISTS workaround)
+        """)
+        try:
+            self.conn.execute("SELECT fill_color_rgb FROM rooms LIMIT 1")
+        except sqlite3.OperationalError:
+            try:
+                self.conn.execute("ALTER TABLE rooms ADD COLUMN fill_color_rgb TEXT")
+            except sqlite3.OperationalError:
+                pass  # table doesn't exist yet, will be created below
+        self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY, name TEXT, created_at TEXT,
                 pdf_path TEXT, scale_px_per_meter REAL, scale_source TEXT
@@ -20,7 +31,8 @@ class Database:
                 name TEXT, room_type TEXT, boundary_polygon TEXT,
                 area_px REAL, perimeter_px REAL, area_sqm REAL, perimeter_m REAL,
                 boundary_lengths_px TEXT, boundary_lengths_m TEXT,
-                centroid_x REAL, centroid_y REAL, source TEXT, confidence REAL
+                centroid_x REAL, centroid_y REAL, fill_color_rgb TEXT,
+                source TEXT, confidence REAL
             );
             CREATE TABLE IF NOT EXISTS excluded_regions (
                 id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id),
@@ -48,13 +60,15 @@ class Database:
 
     def save_room(self, room: RoomData):
         self.conn.execute(
-            "INSERT OR REPLACE INTO rooms VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO rooms VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (room.id, room.project_id, room.name, room.room_type,
              json.dumps(room.boundary_polygon), room.area_px, room.perimeter_px,
              room.area_sqm, room.perimeter_m,
              json.dumps(room.boundary_lengths_px),
              json.dumps(room.boundary_lengths_m) if room.boundary_lengths_m else None,
-             room.centroid[0], room.centroid[1], room.source, room.confidence))
+             room.centroid[0], room.centroid[1],
+             json.dumps(room.fill_color_rgb) if room.fill_color_rgb else None,
+             room.source, room.confidence))
         self.conn.commit()
 
     def get_rooms(self, project_id: str) -> list[RoomData]:
@@ -67,6 +81,7 @@ class Database:
             boundary_lengths_px=json.loads(r["boundary_lengths_px"]) if r["boundary_lengths_px"] else [],
             boundary_lengths_m=json.loads(r["boundary_lengths_m"]) if r["boundary_lengths_m"] else None,
             centroid=(r["centroid_x"] or 0, r["centroid_y"] or 0),
+            fill_color_rgb=json.loads(r["fill_color_rgb"]) if r["fill_color_rgb"] else None,
             source=r["source"] or "cv", confidence=r["confidence"] or 0) for r in rows]
 
     def update_room(self, room: RoomData):

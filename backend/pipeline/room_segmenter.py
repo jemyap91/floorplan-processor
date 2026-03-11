@@ -9,14 +9,20 @@ def segment_rooms(
     wall_mask: np.ndarray,
     min_area_px: int = 500,
     max_area_ratio: float = 0.5,
+    min_area_ratio: float = 0.001,
     simplify_tolerance: float = 2.0,
+    min_compactness: float = 0.03,
+    close_gap_px: int = 5,
     excluded_regions: list | None = None,
 ) -> list[dict]:
     if wall_mask.size == 0 or wall_mask.max() == 0:
         return []
 
     h, w = wall_mask.shape
-    max_area_px = h * w * max_area_ratio
+    total_px = h * w
+    max_area_px = total_px * max_area_ratio
+    # Use the larger of the fixed minimum or the relative minimum
+    effective_min_area = max(min_area_px, int(total_px * min_area_ratio))
 
     # Apply excluded regions by zeroing them out in a working copy
     work_mask = wall_mask.copy()
@@ -24,6 +30,13 @@ def segment_rooms(
         for region in excluded_regions:
             rx, ry, rw, rh = region
             work_mask[ry : ry + rh, rx : rx + rw] = 0
+
+    # Close small gaps in walls so rooms are properly enclosed
+    if close_gap_px > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (close_gap_px, close_gap_px)
+        )
+        work_mask = cv2.morphologyEx(work_mask, cv2.MORPH_CLOSE, kernel)
 
     # Strategy 1: find holes in the wall mask (enclosed rooms appear as holes
     # in the wall contour hierarchy — contours whose parent != -1).
@@ -57,8 +70,23 @@ def segment_rooms(
     rooms = []
     for contour in room_contours:
         area = cv2.contourArea(contour)
-        if area < min_area_px or area > max_area_px:
+        if area < effective_min_area or area > max_area_px:
             continue
+
+        # Filter by compactness (4π × area / perimeter²)
+        # Rooms are roughly compact shapes; thin slivers and furniture are not
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter > 0:
+            compactness = 4 * np.pi * area / (perimeter * perimeter)
+            if compactness < min_compactness:
+                continue
+
+        # Filter by aspect ratio — rooms shouldn't be extremely elongated
+        _, (bw, bh), _ = cv2.minAreaRect(contour)
+        if bw > 0 and bh > 0:
+            aspect = min(bw, bh) / max(bw, bh)
+            if aspect < 0.1:
+                continue
 
         epsilon = simplify_tolerance
         approx = cv2.approxPolyDP(contour, epsilon, True)

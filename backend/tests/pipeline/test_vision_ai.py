@@ -35,7 +35,7 @@ class TestParseJsonResponse:
         assert result is None
 
 class TestClassifyRegions:
-    @patch("backend.pipeline.vision_ai._call_gemini")
+    @patch("backend.pipeline.vision_ai._call_vision")
     def test_returns_regions(self, mock_call):
         mock_call.return_value = json.dumps({
             "floorplan_regions": [{"x": 0, "y": 0, "width": 100, "height": 100}],
@@ -46,7 +46,7 @@ class TestClassifyRegions:
         assert "floorplan_regions" in result
         assert "excluded_regions" in result
 
-    @patch("backend.pipeline.vision_ai._call_gemini")
+    @patch("backend.pipeline.vision_ai._call_vision")
     def test_api_failure_returns_fallback(self, mock_call):
         mock_call.side_effect = Exception("API error")
         img = np.zeros((200, 300, 3), dtype=np.uint8)
@@ -55,7 +55,7 @@ class TestClassifyRegions:
         assert len(result["floorplan_regions"]) == 1
 
 class TestLabelRooms:
-    @patch("backend.pipeline.vision_ai._call_gemini")
+    @patch("backend.pipeline.vision_ai._call_vision")
     def test_returns_labels(self, mock_call):
         mock_call.return_value = json.dumps({
             "rooms": [{"room_id": 0, "name": "Office 201", "type": "office", "confidence": 0.9}]
@@ -66,7 +66,7 @@ class TestLabelRooms:
         assert len(result) == 1
         assert result[0]["name"] == "Office 201"
 
-    @patch("backend.pipeline.vision_ai._call_gemini")
+    @patch("backend.pipeline.vision_ai._call_vision")
     def test_api_failure_returns_unnamed(self, mock_call):
         mock_call.side_effect = Exception("API error")
         img = np.zeros((200, 300, 3), dtype=np.uint8)
