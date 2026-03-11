@@ -8,3 +8,7 @@ node_modules/
 .superpowers/
 venv/
 *.db
+.DS_Store
+*.pdf
+gemini_rooms.json
+gemini_raw_response.txt
