@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from shapely.geometry import Polygon
 from shapely.validation import make_valid
+from backend.pipeline.polygon_utils import merge_collinear_segments
 
 
 def segment_rooms(
@@ -102,6 +103,9 @@ def segment_rooms(
                     continue
         except Exception:
             continue
+
+        # Merge near-collinear segments to clean up noisy vertices
+        poly = merge_collinear_segments(poly)
 
         centroid = poly.centroid
         coords = list(poly.exterior.coords)

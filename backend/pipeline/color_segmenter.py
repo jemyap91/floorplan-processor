@@ -8,12 +8,13 @@ import cv2
 import numpy as np
 from shapely.geometry import Polygon
 from shapely.validation import make_valid
+from backend.pipeline.polygon_utils import merge_collinear_segments
 
 
 def segment_rooms_by_color(
     image: np.ndarray,
     min_color_diff: int = 15,
-    min_area_ratio: float = 0.0001,
+    min_area_ratio: float = 0.00005,
     max_area_ratio: float = 0.4,
     wall_darkness: int = 80,
     wall_dilate_px: int = 3,
@@ -147,6 +148,9 @@ def _contour_to_room(
                 return None
     except Exception:
         return None
+
+    # Merge near-collinear segments to clean up noisy vertices
+    poly = merge_collinear_segments(poly)
 
     centroid = poly.centroid
     coords = list(poly.exterior.coords)
