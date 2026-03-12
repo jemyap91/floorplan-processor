@@ -1,97 +1,64 @@
-"""Vision AI integration for region classification and room labeling.
-
-Supports multiple providers via VISION_PROVIDER env var:
-  - "gemini" (default): Google Gemini 2.5 Pro with Flash fallback
-  - "qwen": Alibaba Qwen VL via DashScope (OpenAI-compatible API)
-"""
-import base64
+"""Vision AI integration for region classification and room labeling using Google Gemini."""
 import json
 import re
 import os
 import numpy as np
 from PIL import Image
-import io
 
 # ---------------------------------------------------------------------------
-# Provider configuration
+# Gemini configuration
 # ---------------------------------------------------------------------------
 
-VISION_PROVIDER = os.environ.get("VISION_PROVIDER", "gemini").lower()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash-lite")
 
-# Gemini settings
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-
-# Qwen settings (DashScope OpenAI-compatible API)
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-vl-max")
-QWEN_FALLBACK_MODEL = os.environ.get("QWEN_FALLBACK_MODEL", "qwen-vl-plus")
-QWEN_BASE_URL = os.environ.get(
-    "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-)
-
-# ---------------------------------------------------------------------------
-# Provider call functions
-# ---------------------------------------------------------------------------
-
-def _image_to_base64(image: np.ndarray) -> str:
-    """Convert numpy image array to base64-encoded JPEG string."""
-    pil_image = Image.fromarray(image)
-    buffer = io.BytesIO()
-    pil_image.save(buffer, format="JPEG", quality=90)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+import time as _time
+import logging as _logging
+_logger = _logging.getLogger(__name__)
 
 
 def _call_gemini(image: np.ndarray, prompt: str) -> str:
-    """Call Google Gemini Vision API."""
-    import google.generativeai as genai
+    """Call Google Gemini Vision API with retry on rate limit.
+
+    Uses the new google-genai SDK (replaces deprecated google.generativeai).
+    """
+    from google import genai
+
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise ValueError("GOOGLE_API_KEY environment variable not set")
-    genai.configure(api_key=api_key)
+
+    client = genai.Client(api_key=api_key)
     pil_image = Image.fromarray(image)
-    try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        response = model.generate_content([prompt, pil_image])
-        return response.text
-    except Exception:
-        model = genai.GenerativeModel(GEMINI_FALLBACK_MODEL)
-        response = model.generate_content([prompt, pil_image])
-        return response.text
+
+    models_to_try = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models_to_try.append(GEMINI_FALLBACK_MODEL)
+
+    last_error = None
+    for model_name in models_to_try:
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, pil_image],
+                )
+                return response.text
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if "429" in err_str or "ResourceExhausted" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    wait = min(30 * (attempt + 1), 90)
+                    _logger.warning(f"Rate limited on {model_name}, retrying in {wait}s...")
+                    _time.sleep(wait)
+                else:
+                    _logger.warning(f"Error with {model_name}: {e}")
+                    break  # non-rate-limit error, try next model
+    raise last_error
 
 
-def _call_qwen(image: np.ndarray, prompt: str) -> str:
-    """Call Qwen VL via DashScope's OpenAI-compatible API."""
-    from openai import OpenAI
-    api_key = os.environ.get("DASHSCOPE_API_KEY")
-    if not api_key:
-        raise ValueError("DASHSCOPE_API_KEY environment variable not set")
-    client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
-    b64_image = _image_to_base64(image)
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
-    try:
-        response = client.chat.completions.create(
-            model=QWEN_MODEL, messages=messages, max_tokens=4096
-        )
-        return response.choices[0].message.content
-    except Exception:
-        response = client.chat.completions.create(
-            model=QWEN_FALLBACK_MODEL, messages=messages, max_tokens=4096
-        )
-        return response.choices[0].message.content
-
-
-def _call_vision(image: np.ndarray, prompt: str) -> str:
-    """Route vision calls to the configured provider."""
-    if VISION_PROVIDER == "qwen":
-        return _call_qwen(image, prompt)
+def _call_vision(image: np.ndarray, prompt: str, **kwargs) -> str:
+    """Call Gemini vision API."""
     return _call_gemini(image, prompt)
 
 def _build_classification_prompt() -> str:
@@ -148,11 +115,11 @@ def _parse_json_response(text: str) -> dict | None:
         pass
     return None
 
-def classify_regions(image: np.ndarray) -> dict:
+def classify_regions(image: np.ndarray, provider: str | None = None) -> dict:
     h, w = image.shape[:2]
     try:
         prompt = _build_classification_prompt()
-        response_text = _call_vision(image, prompt)
+        response_text = _call_vision(image, prompt, provider=provider)
         result = _parse_json_response(response_text)
         if result and "excluded_regions" in result:
             # Convert normalized (0-1) coordinates to pixel coordinates
@@ -174,8 +141,8 @@ def classify_regions(image: np.ndarray) -> dict:
                 "floorplan_regions": [{"x": 0, "y": 0, "width": w, "height": h}],
                 "excluded_regions": pixel_regions,
             }
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"classify_regions failed: {e}")
     return {
         "floorplan_regions": [{"x": 0, "y": 0, "width": w, "height": h}],
         "excluded_regions": [],
@@ -206,18 +173,18 @@ Return ONLY valid JSON:
 ```"""
 
 
-def extract_room_labels_with_gemini(image: np.ndarray) -> dict:
-    """Use Gemini to list all rooms with names/types (no boundaries needed)."""
+def extract_room_labels_with_gemini(image: np.ndarray, provider: str | None = None) -> dict:
+    """Use vision AI to list all rooms with names/types (no boundaries needed)."""
     try:
         prompt = _build_room_listing_prompt()
-        response_text = _call_vision(image, prompt)
+        response_text = _call_vision(image, prompt, provider=provider)
         result = _parse_json_response(response_text)
         if result is None:
             result = _repair_truncated_json(response_text)
         if result and "rooms" in result:
             return result
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"extract_room_labels failed: {e}")
     return {"rooms": [], "scale_text": None}
 
 
@@ -225,6 +192,7 @@ def match_gemini_labels_to_cv_rooms(
     gemini_rooms: list[dict],
     cv_rooms: list[dict],
     image: np.ndarray,
+    provider: str | None = None,
 ) -> list[dict]:
     """Match Gemini room labels to CV-detected room polygons.
 
@@ -273,14 +241,16 @@ Return ONLY valid JSON:
 ```"""
 
     try:
-        response_text = _call_vision(annotated, match_prompt)
+        response_text = _call_vision(annotated, match_prompt, provider=provider)
+        _logger.info(f"Gemini labeling response length: {len(response_text)}")
         result = _parse_json_response(response_text)
         if result is None:
             result = _repair_truncated_json(response_text)
         if result and "rooms" in result:
             return result["rooms"]
-    except Exception:
-        pass
+        _logger.warning(f"Could not parse Gemini labeling response: {response_text[:500]}")
+    except Exception as e:
+        _logger.error(f"match_gemini_labels_to_cv_rooms failed: {e}")
 
     return [{"room_id": i, "name": "Unnamed", "type": "unknown", "confidence": 0.0}
             for i in range(len(cv_rooms))]
@@ -306,7 +276,7 @@ def _repair_truncated_json(text: str) -> dict | None:
     return None
 
 
-def label_rooms(image: np.ndarray, rooms: list) -> list[dict]:
+def label_rooms(image: np.ndarray, rooms: list, provider: str | None = None) -> list[dict]:
     try:
         import cv2
         annotated = image.copy()
@@ -314,10 +284,10 @@ def label_rooms(image: np.ndarray, rooms: list) -> list[dict]:
             cx, cy = int(room["centroid"][0]), int(room["centroid"][1])
             cv2.putText(annotated, str(i), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
         prompt = _build_labeling_prompt(room_count=len(rooms))
-        response_text = _call_vision(annotated, prompt)
+        response_text = _call_vision(annotated, prompt, provider=provider)
         result = _parse_json_response(response_text)
         if result and "rooms" in result:
             return result["rooms"]
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.error(f"label_rooms failed: {e}")
     return [{"room_id": i, "name": "Unnamed", "type": "unknown", "confidence": 0.0} for i in range(len(rooms))]
