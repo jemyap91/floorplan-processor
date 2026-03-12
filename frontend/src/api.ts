@@ -7,20 +7,36 @@ export interface Room {
   name: string;
   room_type: string;
   boundary_polygon: number[][];
+  area_px: number;
+  perimeter_px: number;
   area_sqm: number | null;
   perimeter_m: number | null;
+  boundary_lengths_px: number[];
   boundary_lengths_m: number[] | null;
   centroid: [number, number];
   source: string;
   confidence: number;
 }
 
+export interface ScaleInfo {
+  px_per_meter: number | null;
+  source: string;
+}
+
 export interface ProcessResult {
   project_id: string;
   rooms: Room[];
   excluded_regions: { bbox: number[] }[];
-  scale: { px_per_meter: number | null; source: string };
+  scale: ScaleInfo;
   image_size: { width: number; height: number };
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  created_at: string;
+  scale_px_per_meter: number | null;
+  scale_source: string;
 }
 
 export type ProcessMode = 'hybrid' | 'gemini';
@@ -33,8 +49,13 @@ export async function processFloorplan(file: File, pageNum = 0, mode: ProcessMod
   return data;
 }
 
-export async function getProjects() {
+export async function getProjects(): Promise<Project[]> {
   const { data } = await api.get('/projects');
+  return data;
+}
+
+export async function getProject(projectId: string): Promise<Project> {
+  const { data } = await api.get(`/projects/${projectId}`);
   return data;
 }
 

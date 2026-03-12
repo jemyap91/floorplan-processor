@@ -1,10 +1,11 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { FloorplanCanvas } from './components/FloorplanCanvas';
 import { RoomSidebar } from './components/RoomSidebar';
 import { RoomDetail } from './components/RoomDetail';
 import {
   processFloorplan, updateRoom, deleteRoom, getImageUrl,
-  type Room, type ProcessResult, type ProcessMode,
+  getProjects, getRooms,
+  type Room, type ProcessMode, type ScaleInfo, type Project,
 } from './api';
 
 type AppState = 'idle' | 'processing' | 'ready' | 'error';
@@ -15,12 +16,20 @@ export default function App() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
-  const [scale, setScale] = useState<ProcessResult['scale'] | null>(null);
+  const [scale, setScale] = useState<ScaleInfo | null>(null);
   const [progress, setProgress] = useState('');
   const [mode, setMode] = useState<ProcessMode>('gemini');
+  const [previousProjects, setPreviousProjects] = useState<Project[]>([]);
 
   const selectedRoom = rooms.find((r) => r.id === selectedRoomId) || null;
   const imageUrl = projectId ? getImageUrl(projectId) : null;
+
+  // Load previous projects on mount
+  useEffect(() => {
+    getProjects()
+      .then((projects) => setPreviousProjects(projects))
+      .catch(() => {});
+  }, []);
 
   const handleFileUpload = useCallback(async (file: File) => {
     setState('processing');
@@ -40,6 +49,25 @@ export default function App() {
       setState('error');
     }
   }, [mode]);
+
+  const handleLoadProject = useCallback(async (project: Project) => {
+    setState('processing');
+    setError(null);
+    setProgress('Loading saved project...');
+    try {
+      const projectRooms = await getRooms(project.id);
+      setProjectId(project.id);
+      setRooms(projectRooms);
+      setScale({
+        px_per_meter: project.scale_px_per_meter,
+        source: project.scale_source,
+      });
+      setState('ready');
+    } catch (err: any) {
+      setError(err.message || 'Failed to load project');
+      setState('error');
+    }
+  }, []);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -62,6 +90,19 @@ export default function App() {
     handleRoomUpdate(roomId, { boundary_polygon: polygon });
   }, [handleRoomUpdate]);
 
+  const handleBackToHome = useCallback(() => {
+    setState('idle');
+    setProjectId(null);
+    setRooms([]);
+    setSelectedRoomId(null);
+    setScale(null);
+    setError(null);
+    // Refresh project list
+    getProjects()
+      .then((projects) => setPreviousProjects(projects))
+      .catch(() => {});
+  }, []);
+
   if (state === 'idle' || state === 'error') {
     return (
       <div
@@ -69,7 +110,7 @@ export default function App() {
         onDrop={handleDrop}
         onDragOver={(e) => e.preventDefault()}
       >
-        <div className="text-center space-y-5">
+        <div className="text-center space-y-5 max-w-lg">
           <h1 className="text-2xl font-bold text-neutral-200">Floorplan Processor</h1>
           <p className="text-neutral-500">Drop a floorplan (PDF, PNG, JPG) or click to upload</p>
           <div className="flex items-center justify-center gap-3">
@@ -104,6 +145,30 @@ export default function App() {
             />
           </label>
           {error && <p className="text-red-400 text-sm">{error}</p>}
+
+          {/* Previous projects */}
+          {previousProjects.length > 0 && (
+            <div className="mt-6 pt-6 border-t border-neutral-800">
+              <h3 className="text-xs font-bold text-neutral-500 uppercase tracking-wider mb-3">
+                Previous Projects
+              </h3>
+              <div className="space-y-2 max-h-48 overflow-y-auto">
+                {previousProjects.map((p) => (
+                  <button
+                    key={p.id}
+                    onClick={() => handleLoadProject(p)}
+                    className="w-full text-left px-3 py-2 bg-neutral-900 border border-neutral-800 rounded hover:border-neutral-600 transition-colors"
+                  >
+                    <div className="text-neutral-200 text-sm truncate">{p.name}</div>
+                    <div className="text-neutral-600 text-xs">
+                      {new Date(p.created_at).toLocaleDateString()}
+                      {p.scale_px_per_meter && ` · ${p.scale_px_per_meter.toFixed(1)} px/m`}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -128,6 +193,7 @@ export default function App() {
         onRoomSelect={setSelectedRoomId}
         scale={scale}
         projectId={projectId}
+        onBack={handleBackToHome}
       />
       <FloorplanCanvas
         rooms={rooms}
@@ -138,6 +204,7 @@ export default function App() {
       />
       <RoomDetail
         room={selectedRoom}
+        scale={scale}
         onUpdate={handleRoomUpdate}
         onDelete={handleRoomDelete}
       />

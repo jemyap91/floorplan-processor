@@ -10,17 +10,13 @@ class Database:
         self._create_tables()
 
     def _create_tables(self):
-        self.conn.executescript("""
-            -- Migrate: add fill_color_rgb if missing
-            -- (SQLite ignores ADD COLUMN if it already exists via IF NOT EXISTS workaround)
-        """)
         try:
             self.conn.execute("SELECT fill_color_rgb FROM rooms LIMIT 1")
         except sqlite3.OperationalError:
             try:
                 self.conn.execute("ALTER TABLE rooms ADD COLUMN fill_color_rgb TEXT")
             except sqlite3.OperationalError:
-                pass  # table doesn't exist yet, will be created below
+                pass
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY, name TEXT, created_at TEXT,
@@ -37,6 +33,10 @@ class Database:
             CREATE TABLE IF NOT EXISTS excluded_regions (
                 id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id),
                 region_type TEXT, bbox TEXT
+            );
+            CREATE TABLE IF NOT EXISTS images (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id),
+                data BLOB
             );
         """)
 
@@ -60,7 +60,12 @@ class Database:
 
     def save_room(self, room: RoomData):
         self.conn.execute(
-            "INSERT OR REPLACE INTO rooms VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """INSERT OR REPLACE INTO rooms
+               (id, project_id, name, room_type, boundary_polygon,
+                area_px, perimeter_px, area_sqm, perimeter_m,
+                boundary_lengths_px, boundary_lengths_m,
+                centroid_x, centroid_y, fill_color_rgb, source, confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (room.id, room.project_id, room.name, room.room_type,
              json.dumps(room.boundary_polygon), room.area_px, room.perimeter_px,
              room.area_sqm, room.perimeter_m,
@@ -100,6 +105,15 @@ class Database:
         rows = self.conn.execute("SELECT * FROM excluded_regions WHERE project_id = ?", (project_id,)).fetchall()
         return [ExcludedRegion(id=r["id"], project_id=r["project_id"],
             region_type=r["region_type"], bbox=json.loads(r["bbox"]) if r["bbox"] else []) for r in rows]
+
+    def save_image(self, project_id: str, image_bytes: bytes):
+        self.conn.execute("INSERT OR REPLACE INTO images (project_id, data) VALUES (?, ?)",
+            (project_id, image_bytes))
+        self.conn.commit()
+
+    def get_image(self, project_id: str) -> bytes | None:
+        row = self.conn.execute("SELECT data FROM images WHERE project_id = ?", (project_id,)).fetchone()
+        return row["data"] if row else None
 
     def close(self):
         self.conn.close()

@@ -12,9 +12,10 @@ interface RoomSidebarProps {
   onRoomSelect: (roomId: string) => void;
   scale: { px_per_meter: number | null; source: string } | null;
   projectId: string | null;
+  onBack?: () => void;
 }
 
-export function RoomSidebar({ rooms, selectedRoomId, onRoomSelect, scale, projectId }: RoomSidebarProps) {
+export function RoomSidebar({ rooms, selectedRoomId, onRoomSelect, scale, projectId, onBack }: RoomSidebarProps) {
   const totalArea = rooms.reduce((sum, r) => sum + (r.area_sqm || 0), 0);
   const [exporting, setExporting] = useState(false);
 
@@ -33,9 +34,20 @@ export function RoomSidebar({ rooms, selectedRoomId, onRoomSelect, scale, projec
   return (
     <div className="w-64 bg-neutral-950 border-r border-neutral-800 flex flex-col overflow-hidden">
       <div className="p-3 border-b border-neutral-800 flex items-center justify-between">
-        <h2 className="text-xs font-bold text-sky-400 uppercase tracking-wider">
-          Rooms ({rooms.length})
-        </h2>
+        <div className="flex items-center gap-2">
+          {onBack && (
+            <button
+              onClick={onBack}
+              className="text-neutral-500 hover:text-neutral-300 transition-colors"
+              title="Back to projects"
+            >
+              &larr;
+            </button>
+          )}
+          <h2 className="text-xs font-bold text-sky-400 uppercase tracking-wider">
+            Rooms ({rooms.length})
+          </h2>
+        </div>
         {projectId && (
           <button
             onClick={handleExport}

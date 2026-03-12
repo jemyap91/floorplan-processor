@@ -38,7 +38,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory image cache: project_id -> np.ndarray (RGB)
+# In-memory image cache (fallback when DB image not available)
 _image_cache: dict[str, np.ndarray] = {}
 
 
@@ -121,8 +121,8 @@ async def process_pdf(
         image: np.ndarray = extraction["image"]
         img_h, img_w = image.shape[:2]
 
-        # Cap max dimension to 5000px for tractable processing
-        MAX_DIM = 5000
+        # Cap max dimension to 8000px — balances detail vs processing time
+        MAX_DIM = 8000
         if max(img_h, img_w) > MAX_DIM:
             scale_factor = MAX_DIM / max(img_h, img_w)
             new_w = int(img_w * scale_factor)
@@ -158,8 +158,11 @@ async def process_pdf(
         else:
             rooms_out = _process_hybrid_mode(image, project, px_per_meter, db)
 
-        # Cache the extracted image for later serving
+        # Persist image for later serving (DB + in-memory cache)
         _image_cache[project.id] = image
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        _, img_buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        db.save_image(project.id, img_buf.tobytes())
 
         return {
             "project_id": project.id,
@@ -495,18 +498,21 @@ def update_scale(project_id: str, body: ScaleUpdateRequest):
 
 @app.get("/api/projects/{project_id}/image")
 def get_image(project_id: str):
-    if project_id not in _image_cache:
-        raise HTTPException(status_code=404, detail="Image not available for this project")
+    # Try in-memory cache first
+    if project_id in _image_cache:
+        image = _image_cache[project_id]
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        success, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if success:
+            return Response(content=buf.tobytes(), media_type="image/jpeg")
 
-    import cv2
+    # Fall back to database
+    db = get_db()
+    image_bytes = db.get_image(project_id)
+    if image_bytes:
+        return Response(content=image_bytes, media_type="image/jpeg")
 
-    image = _image_cache[project_id]
-    # Convert RGB -> BGR for OpenCV encoding
-    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    success, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to encode image")
-    return Response(content=buf.tobytes(), media_type="image/jpeg")
+    raise HTTPException(status_code=404, detail="Image not available for this project")
 
 
 # --- Export -----------------------------------------------------------------
