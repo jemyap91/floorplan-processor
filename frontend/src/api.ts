@@ -37,15 +37,27 @@ export interface Project {
   created_at: string;
   scale_px_per_meter: number | null;
   scale_source: string;
+  room_count: number;
 }
 
 export type ProcessMode = 'hybrid' | 'gemini';
 
-export async function processFloorplan(file: File, pageNum = 0, mode: ProcessMode = 'hybrid'): Promise<ProcessResult> {
+export async function processFloorplan(file: File, pageNum = 0, mode: ProcessMode = 'hybrid', jobId?: string): Promise<ProcessResult> {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('mode', mode);
+  if (jobId) formData.append('job_id', jobId);
   const { data } = await api.post(`/process?page_num=${pageNum}`, formData);
+  return data;
+}
+
+export interface ProgressInfo {
+  percent: number;
+  message: string;
+}
+
+export async function getProgress(jobId: string): Promise<ProgressInfo> {
+  const { data } = await api.get(`/progress/${jobId}`);
   return data;
 }
 
@@ -59,8 +71,23 @@ export async function getProject(projectId: string): Promise<Project> {
   return data;
 }
 
+export async function deleteProject(projectId: string) {
+  const { data } = await api.delete(`/projects/${projectId}`);
+  return data;
+}
+
 export async function getRooms(projectId: string): Promise<Room[]> {
   const { data } = await api.get(`/projects/${projectId}/rooms`);
+  return data;
+}
+
+export async function createRoom(projectId: string, name: string, roomType: string, polygon: number[][]): Promise<Room> {
+  const { data } = await api.post('/rooms', {
+    project_id: projectId,
+    name,
+    room_type: roomType,
+    boundary_polygon: polygon,
+  });
   return data;
 }
 

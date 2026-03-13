@@ -96,6 +96,13 @@ class Database:
         self.conn.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
         self.conn.commit()
 
+    def delete_project(self, project_id: str):
+        self.conn.execute("DELETE FROM rooms WHERE project_id = ?", (project_id,))
+        self.conn.execute("DELETE FROM excluded_regions WHERE project_id = ?", (project_id,))
+        self.conn.execute("DELETE FROM images WHERE project_id = ?", (project_id,))
+        self.conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        self.conn.commit()
+
     def save_excluded_region(self, region: ExcludedRegion):
         self.conn.execute("INSERT OR REPLACE INTO excluded_regions VALUES (?, ?, ?, ?)",
             (region.id, region.project_id, region.region_type, json.dumps(region.bbox)))

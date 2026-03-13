@@ -1,4 +1,5 @@
 """FastAPI backend for the floorplan processor pipeline."""
+import asyncio
 import io
 import os
 import tempfile
@@ -41,6 +42,9 @@ app.add_middleware(
 # In-memory image cache (fallback when DB image not available)
 _image_cache: dict[str, np.ndarray] = {}
 
+# Processing progress: job_id -> {step, percent, message}
+_progress: dict[str, dict] = {}
+
 
 def get_db() -> Database:
     db_path = os.environ.get("DB_PATH", "floorplan.db")
@@ -79,7 +83,12 @@ def health():
 def list_projects():
     db = get_db()
     projects = db.list_projects()
-    return [p.model_dump() for p in projects]
+    result = []
+    for p in projects:
+        d = p.model_dump()
+        d["room_count"] = len(db.get_rooms(p.id))
+        result.append(d)
+    return result
 
 
 @app.get("/api/projects/{project_id}")
@@ -88,7 +97,27 @@ def get_project(project_id: str):
     project = db.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
-    return project.model_dump()
+    d = project.model_dump()
+    d["room_count"] = len(db.get_rooms(project_id))
+    return d
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str):
+    db = get_db()
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    db.delete_project(project_id)
+    return {"deleted": project_id}
+
+
+# --- Progress ---------------------------------------------------------------
+
+
+@app.get("/api/progress/{job_id}")
+def get_progress(job_id: str):
+    return _progress.get(job_id, {"step": 0, "percent": 0, "message": "Waiting..."})
 
 
 # --- Process ----------------------------------------------------------------
@@ -100,6 +129,7 @@ async def process_pdf(
     page_num: int = Form(0),
     manual_px_per_meter: Optional[float] = Form(None),
     mode: str = Form("hybrid"),
+    job_id: str = Form(""),
 ):
     """Upload a PDF or image, run the pipeline, persist results, and return them.
 
@@ -112,8 +142,14 @@ async def process_pdf(
         tmp.write(await file.read())
         tmp_path = tmp.name
 
-    try:
+    def _update(percent: int, message: str):
+        if job_id:
+            _progress[job_id] = {"percent": percent, "message": message}
+
+    def _run_pipeline():
+        """Run the full processing pipeline (CPU-bound, runs in a thread)."""
         # 1. Extract image from PDF or image file
+        _update(5, "Extracting image from file...")
         if suffix.lower() in IMAGE_EXTENSIONS:
             extraction = extract_from_image(tmp_path)
         else:
@@ -124,6 +160,7 @@ async def process_pdf(
         # Cap max dimension to 8000px — balances detail vs processing time
         MAX_DIM = 8000
         if max(img_h, img_w) > MAX_DIM:
+            _update(10, f"Resizing image ({img_w}x{img_h} -> {MAX_DIM}px)...")
             scale_factor = MAX_DIM / max(img_h, img_w)
             new_w = int(img_w * scale_factor)
             new_h = int(img_h * scale_factor)
@@ -131,49 +168,62 @@ async def process_pdf(
             img_h, img_w = new_h, new_w
 
         # 2. Detect scale from text
+        _update(15, "Detecting scale...")
         scale_result = detect_scale(
             text=extraction["text"],
             image=image,
             manual_px_per_meter=manual_px_per_meter,
         )
-        px_per_meter: Optional[float] = None
+        px_per_meter_val: float | None = None
         scale_source = "manual"
         if scale_result:
-            px_per_meter = scale_result.get("px_per_meter")
+            px_per_meter_val = scale_result.get("px_per_meter")
             scale_source = scale_result.get("source", "auto")
 
         # Build project
+        _update(20, "Setting up project...")
         project_name = os.path.splitext(os.path.basename(file.filename or "upload.pdf"))[0]
         project = ProjectData(
             name=project_name,
             pdf_path=tmp_path,
-            scale_px_per_meter=px_per_meter,
+            scale_px_per_meter=px_per_meter_val,
             scale_source=scale_source,
         )
         db = get_db()
         db.save_project(project)
 
         if mode == "gemini":
-            rooms_out = _process_gemini_mode(image, project, px_per_meter, db)
+            rooms_out = _process_gemini_mode(image, project, px_per_meter_val, db, _update)
         else:
-            rooms_out = _process_hybrid_mode(image, project, px_per_meter, db)
+            rooms_out = _process_hybrid_mode(image, project, px_per_meter_val, db, _update)
 
         # Persist image for later serving (DB + in-memory cache)
+        _update(95, "Saving image...")
         _image_cache[project.id] = image
         bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         _, img_buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
         db.save_image(project.id, img_buf.tobytes())
 
+        _update(100, "Done!")
         return {
             "project_id": project.id,
             "rooms": rooms_out,
             "scale": scale_result,
         }
+
+    try:
+        # Run in a thread so the event loop stays free for progress polling
+        result = await asyncio.to_thread(_run_pipeline)
+        return result
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+        # Clean up progress after a delay (let frontend read 100%)
+        if job_id:
+            import threading
+            threading.Timer(10, lambda: _progress.pop(job_id, None)).start()
 
 
 def _process_gemini_mode(
@@ -181,15 +231,11 @@ def _process_gemini_mode(
     project: ProjectData,
     px_per_meter: Optional[float],
     db: Database,
+    _update=lambda p, m: None,
 ) -> list[dict]:
-    """Gemini-enhanced pipeline — CV detects boundaries, Gemini labels rooms.
-
-    Uses the same CV wall/room detection as hybrid mode, but replaces the
-    basic Gemini labelling with a smarter approach: annotates the image with
-    numbered centroids and asks Gemini to match room names to numbers.
-    This gives precise CV boundaries with accurate Gemini labels.
-    """
+    """Gemini-enhanced pipeline — CV detects boundaries, Gemini labels rooms."""
     # 1. Classify regions to exclude title block etc.
+    _update(25, "Classifying regions (Gemini)...")
     region_result = classify_regions(image)
     excluded_regions_raw = region_result.get("excluded_regions", [])
 
@@ -203,9 +249,11 @@ def _process_gemini_mode(
         excluded_bboxes.append((rx, ry, rw, rh))
 
     # 3. Color-based room detection (primary — finds colored zone rooms)
+    _update(35, "Detecting colored room zones...")
     color_rooms = segment_rooms_by_color(image, excluded_regions=excluded_bboxes)
 
     # 4. Wall-based detection for unfilled rooms (corridors, lift shafts)
+    _update(45, "Detecting walls...")
     prep = preprocess_image(image)
     binary: np.ndarray = prep["binary"]
     for rx, ry, rw, rh in excluded_bboxes:
@@ -227,12 +275,15 @@ def _process_gemini_mode(
     )
 
     # 5. Merge color + wall rooms
+    _update(55, "Merging detected rooms...")
     raw_rooms = merge_room_lists(color_rooms, wall_rooms)
 
     # 6. Label rooms by annotating image with numbered centroids
+    _update(60, f"Labelling {len(raw_rooms)} rooms (Gemini)...")
     labeled = match_gemini_labels_to_cv_rooms([], raw_rooms, image)
 
-    # 6. Save excluded regions
+    # 7. Save excluded regions
+    _update(80, "Saving results...")
     for er, bbox in zip(excluded_regions_raw, excluded_bboxes):
         excl = ExcludedRegion(
             project_id=project.id,
@@ -293,9 +344,11 @@ def _process_hybrid_mode(
     project: ProjectData,
     px_per_meter: Optional[float],
     db: Database,
+    _update=lambda p, m: None,
 ) -> list[dict]:
     """Hybrid CV + Gemini pipeline — walls detected by CV, rooms labelled by Gemini."""
     # 3. Classify regions (Gemini — may fall back to full-image)
+    _update(25, "Classifying regions (Gemini)...")
     region_result = classify_regions(image)
     excluded_regions_raw = region_result.get("excluded_regions", [])
 
@@ -320,17 +373,21 @@ def _process_hybrid_mode(
         excluded_bboxes.append((rx, ry, rw, rh))
 
     # 6. Detect walls
+    _update(40, "Detecting walls...")
     wall_result = detect_walls(binary)
 
     # 7. Segment rooms
+    _update(50, "Segmenting rooms...")
     raw_rooms = segment_rooms(
         wall_result["wall_mask"], excluded_regions=excluded_bboxes
     )
 
     # 8. Label rooms with vision AI
+    _update(60, f"Labelling {len(raw_rooms)} rooms (Gemini)...")
     labeled = label_rooms(image, raw_rooms)
 
     # 9. Save excluded regions
+    _update(80, "Saving results...")
     for er, bbox in zip(excluded_regions_raw, excluded_bboxes):
         excl = ExcludedRegion(
             project_id=project.id,
@@ -393,6 +450,64 @@ def get_rooms(project_id: str):
     return [r.model_dump() for r in rooms]
 
 
+class CreateRoomRequest(BaseModel):
+    project_id: str
+    name: str = "Unnamed"
+    room_type: str = "unknown"
+    boundary_polygon: list[list[float]]
+
+
+@app.post("/api/rooms")
+def create_room(body: CreateRoomRequest):
+    db = get_db()
+    project = db.get_project(body.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    points = [(float(p[0]), float(p[1])) for p in body.boundary_polygon]
+    if len(points) < 3:
+        raise HTTPException(status_code=400, detail="Need at least 3 vertices")
+
+    poly = Polygon(points)
+    if not poly.is_valid:
+        poly = make_valid(poly)
+
+    coords = list(poly.exterior.coords)
+    boundary_lengths = []
+    for i in range(len(coords) - 1):
+        dx = coords[i + 1][0] - coords[i][0]
+        dy = coords[i + 1][1] - coords[i][1]
+        boundary_lengths.append(float(np.sqrt(dx**2 + dy**2)))
+
+    centroid = poly.centroid
+    polygon_coords = [[x, y] for x, y in coords]
+
+    real = {}
+    if project.scale_px_per_meter:
+        real = to_real_measurements(
+            float(poly.area), float(poly.length),
+            boundary_lengths, project.scale_px_per_meter,
+        )
+
+    room = RoomData(
+        project_id=body.project_id,
+        name=body.name,
+        room_type=body.room_type,
+        boundary_polygon=polygon_coords,
+        area_px=float(poly.area),
+        perimeter_px=float(poly.length),
+        centroid=(float(centroid.x), float(centroid.y)),
+        boundary_lengths_px=boundary_lengths,
+        area_sqm=real.get("area_sqm"),
+        perimeter_m=real.get("perimeter_m"),
+        boundary_lengths_m=real.get("boundary_lengths_m"),
+        source="user",
+        confidence=1.0,
+    )
+    db.save_room(room)
+    return room.model_dump()
+
+
 @app.put("/api/rooms/{room_id}")
 def update_room(room_id: str, body: RoomUpdateRequest):
     db = get_db()
@@ -429,7 +544,7 @@ def update_room(room_id: str, body: RoomUpdateRequest):
         room.perimeter_px = float(poly.length)
         room.centroid = (float(centroid.x), float(centroid.y))
         room.boundary_lengths_px = boundary_lengths
-        room.source = "corrected"
+        room.source = "user"
 
         # Recalculate real measurements if scale is available
         project = db.get_project(room.project_id)

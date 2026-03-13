@@ -161,8 +161,15 @@ export function RoomDetail({ room, scale, onUpdate, onDelete }: RoomDetailProps)
         </div>
         <div>
           <label className="block text-neutral-500 text-xs mb-1">Source</label>
-          <div className={`text-xs ${room.source === 'cv' ? 'text-green-400' : 'text-blue-400'}`}>
-            {room.source === 'cv' ? 'Auto-detected (CV)' : room.source}
+          <div className={`text-xs ${
+            room.source === 'cv' ? 'text-green-400' :
+            room.source === 'user' ? 'text-amber-400' :
+            'text-blue-400'
+          }`}>
+            {room.source === 'cv' ? 'Auto-detected (CV)' :
+             room.source === 'user' ? 'User (manual)' :
+             room.source === 'gemini' ? 'Gemini AI' :
+             room.source}
           </div>
         </div>
         <div>

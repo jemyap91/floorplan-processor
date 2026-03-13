@@ -10,7 +10,8 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash-lite")
+# No fallback — Gemini 2 Flash and Flash Lite have 0 free-tier quota
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "")
 
 import time as _time
 import logging as _logging
@@ -32,7 +33,7 @@ def _call_gemini(image: np.ndarray, prompt: str) -> str:
     pil_image = Image.fromarray(image)
 
     models_to_try = [GEMINI_MODEL]
-    if GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
         models_to_try.append(GEMINI_FALLBACK_MODEL)
 
     last_error = None
