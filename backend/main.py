@@ -859,6 +859,9 @@ def export_project(project_id: str, format: str = "json"):
                 "centroid_y",
                 "source",
                 "confidence",
+                "unit_name",
+                "printed_area_sqm",
+                "area_divergence_flag",
             ],
         )
         writer.writeheader()
@@ -876,6 +879,9 @@ def export_project(project_id: str, format: str = "json"):
                     "centroid_y": room.centroid[1],
                     "source": room.source,
                     "confidence": room.confidence,
+                    "unit_name": room.unit_name,
+                    "printed_area_sqm": room.printed_area_sqm,
+                    "area_divergence_flag": room.area_divergence_flag,
                 }
             )
         return Response(
