@@ -81,36 +81,41 @@ def _call_gemini_with_model(image: np.ndarray, prompt: str, model: str | None = 
 
 def _build_pass1_prompt() -> str:
     """Build Gemini prompt for identifying apartment units and public spaces."""
-    return """You are analyzing a furnished architectural floorplan drawing. Identify ALL distinct apartment units and public/shared spaces.
+    return """You are an expert architectural floor plan analyzer specialized in computer vision and spatial layout extraction.
+
+Task: Identify ALL distinct apartment units and public/shared spaces in this floor plan.
+
+Core Instructions:
+- Structural Boundary Priority: Identify boundaries based strictly on structural wall lines (solid lines for full walls, dashed for pony walls/openings).
+- Noise Filtering (Crucial): Ignore all non-structural elements. Do NOT be distracted by dimension lines, arrows, measurement text, furniture icons, appliance symbols, text labels, or hatching patterns.
 
 For each unit/space, provide:
 1. **name**: The unit label as written on the plan (e.g. "UNIT 20.01"). For public areas use the label (e.g. "Lobby", "Stair E").
 2. **type**: One of: residential, public, lobby, stairwell, corridor, utility, mechanical, elevator
-3. **bbox**: Normalized bounding box [x, y, width, height] where values are 0.0-1.0 relative to image dimensions. (x,y) is the top-left corner.
+3. **box_2d**: Bounding box as [ymin, xmin, ymax, xmax] with values from 0 to 1000.
 
-CRITICAL INSTRUCTIONS FOR BOUNDING BOXES:
-- The bbox must enclose the ENTIRE FLOOR AREA of the unit — all its rooms, walls, corridors, and balconies.
-- Do NOT just box the unit's text label. Box the full physical space the unit occupies on the plan.
-- Residential units typically occupy large rectangular areas containing multiple rooms (bedrooms, kitchen, bathrooms, living areas).
-- Each residential unit's bbox should be large enough to contain all rooms within that apartment.
-- Public spaces may be smaller (corridors, elevator shafts, utility rooms).
-- Do NOT include title blocks, legends, notes, or margins — only the actual building floor area.
+CRITICAL:
+- The box must enclose the ENTIRE FLOOR AREA of the unit — all its rooms, walls, corridors, and balconies.
+- Do NOT just box the unit's text label. Box the full physical space the unit occupies.
+- Residential units are LARGE areas containing multiple rooms (bedrooms, kitchen, bathrooms, living areas).
+- Do NOT include title blocks, legends, notes, or margins.
 - Bboxes for adjacent units should NOT significantly overlap.
 
 Return ONLY valid JSON:
 ```json
 {
   "units": [
-    {"name": "UNIT 20.01", "type": "residential", "bbox": [0.05, 0.1, 0.4, 0.45]},
-    {"name": "Lobby", "type": "lobby", "bbox": [0.45, 0.3, 0.15, 0.2]}
+    {"name": "UNIT 20.01", "type": "residential", "box_2d": [100, 50, 500, 400]},
+    {"name": "Lobby", "type": "lobby", "box_2d": [300, 450, 500, 600]}
   ]
 }
 ```"""
 
 
 def _parse_pass1_response(response_text: str, img_w: int, img_h: int) -> list[dict]:
-    """Parse Pass 1 response, converting normalized coords to pixel coords.
+    """Parse Pass 1 response, converting 0-1000 coords to pixel coords.
 
+    Gemini returns [ymin, xmin, ymax, xmax] in 0-1000 scale.
     Returns list of dicts with keys: name, type, bbox_px (x, y, w, h in pixels), is_public.
     """
     result = _parse_json(response_text)
@@ -123,21 +128,22 @@ def _parse_pass1_response(response_text: str, img_w: int, img_h: int) -> list[di
     for u in result["units"]:
         name = u.get("name", "Unknown")
         utype = u.get("type", "unknown")
-        bbox = u.get("bbox", [0, 0, 0, 0])
-        if len(bbox) != 4:
+        box = u.get("box_2d", [0, 0, 0, 0])
+        if len(box) != 4:
             continue
-        x, y, w, h = bbox
-        bbox_px = (
-            int(round(x * img_w)),
-            int(round(y * img_h)),
-            int(round(w * img_w)),
-            int(round(h * img_h)),
-        )
+        ymin, xmin, ymax, xmax = box
+        # Convert 0-1000 to pixel coordinates
+        x = int(round(xmin / 1000 * img_w))
+        y = int(round(ymin / 1000 * img_h))
+        w = int(round((xmax - xmin) / 1000 * img_w))
+        h = int(round((ymax - ymin) / 1000 * img_h))
+        if w <= 0 or h <= 0:
+            continue
         is_public = utype.lower() in PUBLIC_TYPES
         units.append({
             "name": name,
             "type": utype,
-            "bbox_px": bbox_px,
+            "bbox_px": (x, y, w, h),
             "is_public": is_public,
         })
     return units
@@ -160,36 +166,43 @@ def analyze_units(image: np.ndarray, model: str | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _build_pass2_prompt(unit_name: str) -> str:
-    """Build Gemini prompt for extracting room polygons within a cropped unit image."""
-    return f"""You are analyzing a cropped section of an architectural floorplan showing "{unit_name}".
+    """Build Gemini prompt for extracting room bounding boxes within a cropped unit image."""
+    return f"""You are an expert architectural floor plan analyzer specialized in computer vision and spatial layout extraction.
 
-Identify EVERY distinct room and enclosed space within this unit. For each room, provide:
+Task: Perform semantic segmentation on this cropped floor plan section showing "{unit_name}" to identify all functional room areas.
+
+Core Instructions:
+- Structural Boundary Priority: Identify room boundaries based strictly on structural wall lines (solid lines for full walls, dashed for pony walls/openings).
+- Noise Filtering (Crucial): Ignore all non-structural elements. Do NOT be distracted by dimension lines, arrows, measurement text numbers, furniture icons (beds, sofas, tables), appliance symbols, text labels, or hatching patterns.
+
+For each room, provide:
 1. **name**: The room label as written (e.g. "Master Bedroom", "Kitchen", "Bathroom 1")
 2. **type**: One of: bedroom, bathroom, kitchen, living_room, dining_room, balcony, corridor, storage, utility, study, laundry, other
-3. **polygon**: A list of [x, y] vertex points forming the room boundary, in normalized coordinates (0.0-1.0 relative to this image). Minimum 3 points.
+3. **box_2d**: Bounding box as [ymin, xmin, ymax, xmax] with values from 0 to 1000. The box must fit within the inner faces of the structural walls.
 4. **area_sqm**: The printed area in square meters if visible on the plan, or null.
 
-IMPORTANT:
-- Trace the polygon along room walls/boundaries
+CRITICAL:
 - Include ALL rooms: bedrooms, bathrooms, kitchen, living areas, balconies, corridors, storage
-- Polygon points should go clockwise
-- Use at least 4 points for rectangular rooms
+- Boxes must align with structural wall lines, NOT furniture edges
+- For open-concept spaces (living/dining/kitchen with no separating wall), return ONE merged box
+- Door openings separate rooms — each side of a doorway is a different room
 
 Return ONLY valid JSON:
 ```json
 {{
   "rooms": [
-    {{"name": "Master Bedroom", "type": "bedroom", "polygon": [[0.05, 0.05], [0.45, 0.05], [0.45, 0.5], [0.05, 0.5]], "area_sqm": 15.2}},
-    {{"name": "Kitchen", "type": "kitchen", "polygon": [[0.5, 0.0], [0.95, 0.0], [0.95, 0.4], [0.5, 0.4]], "area_sqm": null}}
+    {{"name": "Master Bedroom", "type": "bedroom", "box_2d": [50, 50, 450, 500], "area_sqm": 15.2}},
+    {{"name": "Kitchen", "type": "kitchen", "box_2d": [0, 500, 400, 950], "area_sqm": null}}
   ]
 }}
 ```"""
 
 
 def _parse_pass2_response(response_text: str, crop_w: int, crop_h: int) -> list[dict]:
-    """Parse Pass 2 response, converting normalized polygon coords to crop-pixel coords.
+    """Parse Pass 2 response, converting 0-1000 box coords to crop-pixel coords.
 
-    Returns list of dicts with keys: name, type, polygon_px, printed_area_sqm.
+    Gemini returns [ymin, xmin, ymax, xmax] in 0-1000 scale.
+    Returns list of dicts with keys: name, type, polygon_px (4-point rect), printed_area_sqm.
     """
     result = _parse_json(response_text)
     if result is None:
@@ -199,18 +212,19 @@ def _parse_pass2_response(response_text: str, crop_w: int, crop_h: int) -> list[
 
     rooms = []
     for r in result["rooms"]:
-        polygon_norm = r.get("polygon", [])
-        if len(polygon_norm) < 3:
-            continue  # skip invalid polygons
-        polygon_px = []
-        for pt in polygon_norm:
-            if len(pt) < 2:
-                continue
-            px = int(round(pt[0] * crop_w))
-            py = int(round(pt[1] * crop_h))
-            polygon_px.append((px, py))
-        if len(polygon_px) < 3:
+        box = r.get("box_2d", [])
+        if len(box) != 4:
             continue
+        ymin, xmin, ymax, xmax = box
+        # Convert 0-1000 to pixel coordinates
+        x1 = int(round(xmin / 1000 * crop_w))
+        y1 = int(round(ymin / 1000 * crop_h))
+        x2 = int(round(xmax / 1000 * crop_w))
+        y2 = int(round(ymax / 1000 * crop_h))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        # Convert bbox to 4-point polygon
+        polygon_px = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
         rooms.append({
             "name": r.get("name", "Unknown"),
             "type": r.get("type", "other"),
