@@ -359,6 +359,8 @@ def run_furnished_pipeline(
     if detail_model is None:
         detail_model = flash_model
 
+    _logger.info(f"Starting furnished pipeline: flash={flash_model}, detail={detail_model}")
+
     def _progress(pct, msg):
         if progress_cb:
             progress_cb(pct, msg)
