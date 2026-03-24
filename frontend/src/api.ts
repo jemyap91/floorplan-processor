@@ -16,6 +16,9 @@ export interface Room {
   centroid: [number, number];
   source: string;
   confidence: number;
+  unit_name: string | null;
+  printed_area_sqm: number | null;
+  area_divergence_flag: boolean;
 }
 
 export interface ScaleInfo {
@@ -38,15 +41,21 @@ export interface Project {
   scale_px_per_meter: number | null;
   scale_source: string;
   room_count: number;
+  process_mode: string;
 }
 
-export type ProcessMode = 'hybrid' | 'gemini';
+export type ProcessMode = 'hybrid' | 'gemini' | 'linedraw' | 'furnished';
 
-export async function processFloorplan(file: File, pageNum = 0, mode: ProcessMode = 'hybrid', jobId?: string): Promise<ProcessResult> {
+export async function processFloorplan(
+  file: File, pageNum = 0, mode: ProcessMode = 'hybrid',
+  jobId?: string, filterColors = true, geminiModel = 'flash',
+): Promise<ProcessResult> {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('mode', mode);
+  formData.append('gemini_model', geminiModel);
   if (jobId) formData.append('job_id', jobId);
+  if (mode === 'linedraw') formData.append('filter_colors', filterColors ? 'true' : 'false');
   const { data } = await api.post(`/process?page_num=${pageNum}`, formData);
   return data;
 }

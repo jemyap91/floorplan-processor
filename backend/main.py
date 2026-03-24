@@ -24,6 +24,7 @@ from backend.pipeline.room_segmenter import segment_rooms
 from backend.pipeline.scale_detector import detect_scale
 from backend.pipeline.vision_ai import classify_regions, match_gemini_labels_to_cv_rooms, label_rooms
 from backend.pipeline.wall_detector import detect_walls
+from backend.pipeline.linedraw_preprocessor import preprocess_linedraw
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -130,10 +131,13 @@ async def process_pdf(
     manual_px_per_meter: Optional[float] = Form(None),
     mode: str = Form("hybrid"),
     job_id: str = Form(""),
+    filter_colors: str = Form("true"),
+    gemini_model: str = Form("flash"),
 ):
     """Upload a PDF or image, run the pipeline, persist results, and return them.
 
-    mode: "hybrid" (CV + Gemini labelling) or "gemini" (pure Gemini extraction)
+    mode: "hybrid" | "gemini" | "linedraw"
+    filter_colors: "true"/"false" — only used in linedraw mode
     Supported formats: PDF, PNG, JPG, JPEG, TIFF, BMP, WebP
     """
     # Save upload to temp file
@@ -188,12 +192,18 @@ async def process_pdf(
             pdf_path=tmp_path,
             scale_px_per_meter=px_per_meter_val,
             scale_source=scale_source,
+            process_mode=mode,
         )
         db = get_db()
         db.save_project(project)
 
         if mode == "gemini":
             rooms_out = _process_gemini_mode(image, project, px_per_meter_val, db, _update)
+        elif mode == "linedraw":
+            do_filter = filter_colors.lower() != "false"
+            rooms_out = _process_linedraw_mode(image, project, px_per_meter_val, db, _update, do_filter)
+        elif mode == "furnished":
+            rooms_out = _process_furnished_mode(image, project, px_per_meter_val, db, _update, gemini_model)
         else:
             rooms_out = _process_hybrid_mode(image, project, px_per_meter_val, db, _update)
 
@@ -437,6 +447,208 @@ def _process_hybrid_mode(
     return rooms_out
 
 
+def _process_linedraw_mode(
+    image: np.ndarray,
+    project: ProjectData,
+    px_per_meter: Optional[float],
+    db: Database,
+    _update=lambda p, m: None,
+    filter_colors: bool = True,
+) -> list[dict]:
+    """Line-drawing pipeline — optimized for professional architectural drawings.
+
+    Uses color filtering to remove grid lines/doors, wall thickness isolation
+    to filter furniture, and aggressive gap closing to bridge doorways.
+    """
+    # 1. Linedraw-specific preprocessing
+    _update(25, "Preprocessing line drawing...")
+    ld_result = preprocess_linedraw(image, filter_colors=filter_colors)
+    binary: np.ndarray = ld_result["binary"]
+
+    # 2. Classify regions to exclude title block etc.
+    _update(35, "Classifying regions (Gemini)...")
+    region_result = classify_regions(image)
+    excluded_regions_raw = region_result.get("excluded_regions", [])
+
+    excluded_bboxes = []
+    for er in excluded_regions_raw:
+        rx = int(er.get("x", 0))
+        ry = int(er.get("y", 0))
+        rw = int(er.get("width", 0))
+        rh = int(er.get("height", 0))
+        binary[ry : ry + rh, rx : rx + rw] = 0
+        excluded_bboxes.append((rx, ry, rw, rh))
+
+    # Also apply margin detection
+    margin_regions = detect_margin_regions(binary)
+    for rx, ry, rw, rh in margin_regions:
+        binary[ry : ry + rh, rx : rx + rw] = 0
+        excluded_bboxes.append((rx, ry, rw, rh))
+
+    # 3. Detect walls with relaxed gap tolerance
+    _update(45, "Detecting walls (line drawing mode)...")
+    wall_result = detect_walls(binary, max_line_gap=25)
+
+    # 4. Segment rooms with aggressive gap closing and relaxed filters
+    _update(55, "Segmenting rooms...")
+    raw_rooms = segment_rooms(
+        wall_result["wall_mask"],
+        excluded_regions=excluded_bboxes,
+        close_gap_px=15,
+        min_compactness=0.01,
+        min_aspect_ratio=0.05,
+    )
+
+    # 5. Label rooms with Gemini
+    _update(65, f"Labelling {len(raw_rooms)} rooms (Gemini)...")
+    labeled = match_gemini_labels_to_cv_rooms([], raw_rooms, image)
+
+    # 6. Save excluded regions
+    _update(80, "Saving results...")
+    for er, bbox in zip(excluded_regions_raw, excluded_bboxes):
+        excl = ExcludedRegion(
+            project_id=project.id,
+            region_type=er.get("type", "table"),
+            bbox=list(bbox),
+        )
+        db.save_excluded_region(excl)
+
+    # 7. Build and save rooms
+    rooms_out = []
+    for i, raw in enumerate(raw_rooms):
+        label_info = labeled[i] if i < len(labeled) else {}
+        name = label_info.get("name", "Unnamed")
+
+        if name == "NOT_A_ROOM":
+            continue
+
+        poly = raw["polygon"]
+        polygon_coords = [[x, y] for x, y in list(poly.exterior.coords)]
+
+        real = {}
+        if px_per_meter:
+            real = to_real_measurements(
+                raw["area_px"],
+                raw["perimeter_px"],
+                raw["boundary_lengths_px"],
+                px_per_meter,
+            )
+
+        fill_color = _sample_fill_color(image, raw["centroid"], raw["polygon"])
+
+        room = RoomData(
+            project_id=project.id,
+            name=name,
+            room_type=label_info.get("type", "unknown"),
+            boundary_polygon=polygon_coords,
+            area_px=raw["area_px"],
+            perimeter_px=raw["perimeter_px"],
+            centroid=raw["centroid"],
+            boundary_lengths_px=raw["boundary_lengths_px"],
+            area_sqm=real.get("area_sqm"),
+            perimeter_m=real.get("perimeter_m"),
+            boundary_lengths_m=real.get("boundary_lengths_m"),
+            fill_color_rgb=fill_color,
+            source="linedraw",
+            confidence=float(label_info.get("confidence", 0.0)),
+        )
+        db.save_room(room)
+        rooms_out.append(room.model_dump())
+
+    return rooms_out
+
+
+def _process_furnished_mode(
+    image: np.ndarray,
+    project: ProjectData,
+    px_per_meter: Optional[float],
+    db: Database,
+    _update=lambda p, m: None,
+    gemini_model: str = "flash",
+) -> list[dict]:
+    """Furnished residential pipeline — Gemini two-pass room detection."""
+    from backend.pipeline.furnished_analyzer import run_furnished_pipeline
+
+    model_map = {
+        "flash": "gemini-2.5-flash",
+        "pro": "gemini-2.5-pro",
+    }
+    detail_model = model_map.get(gemini_model, "gemini-2.5-flash")
+    flash_model = "gemini-2.5-flash"
+
+    _update(10, "Analyzing floor plan (Pass 1 — identifying units)...")
+
+    debug_dir = os.path.join(os.path.dirname(project.pdf_path or "."), "debug")
+
+    def _pipeline_progress(percent: int, message: str):
+        mapped = 10 + int(percent * 0.7)
+        _update(mapped, message)
+
+    raw_rooms = run_furnished_pipeline(
+        image,
+        flash_model=flash_model,
+        detail_model=detail_model,
+        px_per_meter=px_per_meter,
+        debug_dir=debug_dir,
+        progress_cb=_pipeline_progress,
+    )
+
+    _update(80, f"Saving {len(raw_rooms)} rooms...")
+
+    rooms_out = []
+    for raw in raw_rooms:
+        polygon_coords = raw.get("polygon_px", [])
+        if not polygon_coords:
+            continue
+
+        # Convert polygon to list-of-lists for JSON serialization
+        boundary_polygon = [list(pt) for pt in polygon_coords]
+
+        # Compute boundary segment lengths
+        boundary_lengths_px = []
+        for i in range(len(polygon_coords)):
+            p1 = polygon_coords[i]
+            p2 = polygon_coords[(i + 1) % len(polygon_coords)]
+            length = ((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2) ** 0.5
+            boundary_lengths_px.append(length)
+
+        real = {}
+        if px_per_meter:
+            real = to_real_measurements(
+                raw["area_px"],
+                raw["perimeter_px"],
+                boundary_lengths_px,
+                px_per_meter,
+            )
+
+        fill_color = _sample_fill_color(image, raw["centroid"], polygon_coords)
+
+        room = RoomData(
+            project_id=project.id,
+            name=raw["name"],
+            room_type=raw.get("type", "unknown"),
+            boundary_polygon=boundary_polygon,
+            area_px=raw["area_px"],
+            perimeter_px=raw["perimeter_px"],
+            centroid=raw["centroid"],
+            boundary_lengths_px=boundary_lengths_px,
+            area_sqm=real.get("area_sqm"),
+            perimeter_m=real.get("perimeter_m"),
+            boundary_lengths_m=real.get("boundary_lengths_m"),
+            fill_color_rgb=fill_color,
+            source="furnished",
+            confidence=0.7,
+            unit_name=raw.get("unit_name"),
+            printed_area_sqm=raw.get("printed_area_sqm"),
+            area_divergence_flag=raw.get("area_divergence", False),
+        )
+        db.save_room(room)
+        rooms_out.append(room.model_dump())
+
+    _update(100, "Done!")
+    return rooms_out
+
+
 # --- Rooms ------------------------------------------------------------------
 
 
@@ -658,6 +870,9 @@ def export_project(project_id: str, format: str = "json"):
                 "centroid_y",
                 "source",
                 "confidence",
+                "unit_name",
+                "printed_area_sqm",
+                "area_divergence_flag",
             ],
         )
         writer.writeheader()
@@ -675,6 +890,9 @@ def export_project(project_id: str, format: str = "json"):
                     "centroid_y": room.centroid[1],
                     "source": room.source,
                     "confidence": room.confidence,
+                    "unit_name": room.unit_name,
+                    "printed_area_sqm": room.printed_area_sqm,
+                    "area_divergence_flag": room.area_divergence_flag,
                 }
             )
         return Response(

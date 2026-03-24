@@ -20,6 +20,9 @@ class RoomData(BaseModel):
     fill_color_rgb: list[int] | None = None
     source: str = "cv"
     confidence: float = 0.0
+    unit_name: Optional[str] = None
+    printed_area_sqm: Optional[float] = None
+    area_divergence_flag: bool = False
 
 class ProjectData(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -28,6 +31,7 @@ class ProjectData(BaseModel):
     pdf_path: str = ""
     scale_px_per_meter: Optional[float] = None
     scale_source: str = "manual"
+    process_mode: str = "hybrid"
 
 class ExcludedRegion(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))

@@ -65,3 +65,24 @@ class TestDatabase:
         db.save_project(ProjectData(name="P2", pdf_path="/b.pdf"))
         projects = db.list_projects()
         assert len(projects) == 2
+
+    def test_save_and_get_room_with_unit_fields(self):
+        from backend.models.room import RoomData, ProjectData
+        db = Database(":memory:")
+        project = ProjectData(id="p1", name="Test")
+        db.save_project(project)
+        room = RoomData(
+            id="r1", project_id="p1", name="Bedroom",
+            boundary_polygon=[[0, 0], [10, 0], [10, 10], [0, 10]],
+            area_px=100.0, perimeter_px=40.0, centroid=(5.0, 5.0),
+            boundary_lengths_px=[10.0, 10.0, 10.0, 10.0],
+            unit_name="UNIT 20.01",
+            printed_area_sqm=12.5,
+            area_divergence_flag=True,
+        )
+        db.save_room(room)
+        rooms = db.get_rooms("p1")
+        assert len(rooms) == 1
+        assert rooms[0].unit_name == "UNIT 20.01"
+        assert rooms[0].printed_area_sqm == 12.5
+        assert rooms[0].area_divergence_flag is True

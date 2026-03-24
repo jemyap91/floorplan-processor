@@ -24,6 +24,30 @@ class TestRoomData:
         assert d["name"] == "Test"
         assert d["boundary_polygon"] == [[0, 0], [10, 0], [10, 10], [0, 10]]
 
+    def test_room_unit_name_field(self):
+        room = RoomData(
+            id="room-1", name="Master Bedroom", room_type="bedroom",
+            boundary_polygon=[[0, 0], [100, 0], [100, 50], [0, 50]],
+            area_px=5000.0, perimeter_px=300.0, centroid=(50.0, 25.0),
+            boundary_lengths_px=[100.0, 50.0, 100.0, 50.0],
+            unit_name="UNIT 20.01",
+            printed_area_sqm=15.5,
+            area_divergence_flag=True,
+        )
+        assert room.unit_name == "UNIT 20.01"
+        assert room.printed_area_sqm == 15.5
+        assert room.area_divergence_flag is True
+        d = room.model_dump()
+        assert d["unit_name"] == "UNIT 20.01"
+        assert d["printed_area_sqm"] == 15.5
+        assert d["area_divergence_flag"] is True
+
+    def test_room_new_fields_default_values(self):
+        room = RoomData(id="room-2", name="Test")
+        assert room.unit_name is None
+        assert room.printed_area_sqm is None
+        assert room.area_divergence_flag is False
+
 class TestRealMeasurements:
     def test_convert_area(self):
         result = to_real_measurements(

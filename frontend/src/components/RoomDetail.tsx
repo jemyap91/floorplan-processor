@@ -92,6 +92,13 @@ export function RoomDetail({ room, scale, onUpdate, onDelete }: RoomDetailProps)
           </select>
         </div>
 
+        {room.unit_name && (
+          <div>
+            <label className="block text-neutral-500 text-xs mb-1">Unit</label>
+            <div className="text-neutral-300 text-sm">{room.unit_name}</div>
+          </div>
+        )}
+
         {/* Area */}
         <div>
           <label className="block text-neutral-500 text-xs mb-1">Area</label>
@@ -101,6 +108,16 @@ export function RoomDetail({ room, scale, onUpdate, onDelete }: RoomDetailProps)
           <div className="text-neutral-500 text-xs mt-0.5">
             {room.area_px.toLocaleString(undefined, { maximumFractionDigits: 0 })} px²
           </div>
+          {room.printed_area_sqm != null && (
+            <div className="text-neutral-500 text-xs mt-0.5">
+              Printed: {room.printed_area_sqm} m²
+              {room.area_divergence_flag && (
+                <span className="text-amber-400 ml-1" title="Polygon area differs significantly from printed area">
+                  ⚠ divergence
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Perimeter */}
@@ -164,11 +181,15 @@ export function RoomDetail({ room, scale, onUpdate, onDelete }: RoomDetailProps)
           <div className={`text-xs ${
             room.source === 'cv' ? 'text-green-400' :
             room.source === 'user' ? 'text-amber-400' :
+            room.source === 'linedraw' ? 'text-orange-400' :
+            room.source === 'furnished' ? 'text-emerald-400' :
             'text-blue-400'
           }`}>
             {room.source === 'cv' ? 'Auto-detected (CV)' :
              room.source === 'user' ? 'User (manual)' :
              room.source === 'gemini' ? 'Gemini AI' :
+             room.source === 'linedraw' ? 'Line Drawing (CV)' :
+             room.source === 'furnished' ? 'Furnished (Gemini)' :
              room.source}
           </div>
         </div>
