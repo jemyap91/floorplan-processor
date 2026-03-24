@@ -401,6 +401,14 @@ def run_furnished_pipeline(
             "printed_area_sqm": None,
         })
 
+    # Wall snapping: refine polygon vertices by snapping to nearest dark pixels
+    _progress(82, "Snapping polygons to walls...")
+    from backend.pipeline.wall_snapper import snap_polygon_to_walls
+    import cv2 as _cv2
+    gray = _cv2.cvtColor(image, _cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    for room in all_rooms:
+        room["polygon_px"] = snap_polygon_to_walls(room["polygon_px"], gray, radius=40)
+
     # Compute geometry for all rooms
     _progress(85, "Computing room geometry...")
     for room in all_rooms:
