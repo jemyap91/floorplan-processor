@@ -351,6 +351,105 @@ def _save_debug_images(image: np.ndarray, units: list[dict], rooms: list[dict], 
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+def _match_gemini_rooms_to_cv_contours(
+    gemini_rooms: list[dict],
+    cv_rooms: list[dict],
+    unit_offset: tuple[int, int],
+) -> list[dict]:
+    """Match Gemini-identified rooms to CV-detected contours by overlap.
+
+    For each Gemini room (bounding box), find the CV contour whose centroid
+    falls inside the Gemini box. If matched, use the CV contour's polygon
+    (precise walls) but keep Gemini's name/type/area metadata.
+
+    Args:
+        gemini_rooms: Rooms from Pass 2 with polygon_px (4-point bbox in full-image coords).
+        cv_rooms: Rooms from CV segmenter with polygon (Shapely), centroid, etc. in crop coords.
+        unit_offset: (x, y) offset of the unit crop in the full image.
+
+    Returns:
+        Merged room list with CV polygons where matched, Gemini boxes as fallback.
+    """
+    from shapely.geometry import box as shapely_box, Point
+
+    ox, oy = unit_offset
+    matched_cv = set()
+    result = []
+
+    for gr in gemini_rooms:
+        pts = gr["polygon_px"]  # 4-point bbox in full-image coords
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        gemini_box = shapely_box(min(xs), min(ys), max(xs), max(ys))
+
+        best_cv_idx = None
+        best_overlap = 0
+
+        for ci, cv_room in enumerate(cv_rooms):
+            if ci in matched_cv:
+                continue
+            # CV centroid is in crop coords — offset to full image
+            cx = cv_room["centroid"][0] + ox
+            cy = cv_room["centroid"][1] + oy
+            if gemini_box.contains(Point(cx, cy)):
+                # Use area as tiebreaker — prefer larger CV room
+                overlap = cv_room["area_px"]
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_cv_idx = ci
+
+        if best_cv_idx is not None:
+            matched_cv.add(best_cv_idx)
+            cv_room = cv_rooms[best_cv_idx]
+            # Use CV polygon (precise walls) but Gemini metadata
+            cv_coords = list(cv_room["polygon"].exterior.coords)[:-1]
+            polygon_px = [(int(round(x + ox)), int(round(y + oy))) for x, y in cv_coords]
+            result.append({
+                "name": gr.get("name", "Unknown"),
+                "type": gr.get("type", "other"),
+                "unit_name": gr.get("unit_name"),
+                "polygon_px": polygon_px,
+                "printed_area_sqm": gr.get("printed_area_sqm"),
+            })
+        else:
+            # No CV match — use Gemini bbox as fallback
+            result.append(gr)
+
+    return result
+
+
+def _cv_segment_unit(image: np.ndarray, unit: dict) -> list[dict]:
+    """Run CV wall detection + room segmentation on a unit crop.
+
+    Returns list of room dicts from the room segmenter (in crop coordinates).
+    """
+    import cv2
+
+    x, y, w, h = unit["bbox_px"]
+    img_h, img_w = image.shape[:2]
+    x2 = min(x + w, img_w)
+    y2 = min(y + h, img_h)
+    crop = image[y:y2, x:x2]
+
+    if crop.size == 0:
+        return []
+
+    from backend.pipeline.preprocessor import preprocess_image
+    from backend.pipeline.wall_detector import detect_walls
+    from backend.pipeline.room_segmenter import segment_rooms
+
+    prep = preprocess_image(crop)
+    walls = detect_walls(prep["binary"])
+    rooms = segment_rooms(
+        walls["wall_mask"],
+        min_area_px=200,
+        min_area_ratio=0.005,
+        min_compactness=0.02,
+        close_gap_px=7,
+    )
+    return rooms
+
+
 def run_furnished_pipeline(
     image: np.ndarray,
     flash_model: str = "gemini-2.5-flash",
@@ -359,12 +458,16 @@ def run_furnished_pipeline(
     debug_dir: str | None = None,
     progress_cb=None,
 ) -> list[dict]:
-    """Run the full two-pass furnished floorplan analysis pipeline.
+    """Run the hybrid Gemini+CV furnished floorplan analysis pipeline.
+
+    Gemini identifies rooms (names, types, approximate locations).
+    CV detects precise wall-aligned contours.
+    Rooms are matched by spatial overlap — CV polygons with Gemini labels.
 
     Args:
         image: Full floorplan image (BGR numpy array).
         flash_model: Gemini model for Pass 1 (unit detection).
-        detail_model: Gemini model for Pass 2 (room polygons). Defaults to flash_model.
+        detail_model: Gemini model for Pass 2 (room identification). Defaults to flash_model.
         px_per_meter: Scale factor for area computation.
         debug_dir: Directory path for saving debug images (None to skip).
         progress_cb: Optional callback(percent, message) for progress reporting.
@@ -397,12 +500,22 @@ def run_furnished_pipeline(
     public_units = [u for u in units if u["is_public"]]
     total_work = len(residential_units) + 1  # +1 for pass1
 
-    # Pass 2: extract room polygons for residential units
+    # Pass 2: for each residential unit, get Gemini rooms + CV contours, then match
     for i, unit in enumerate(residential_units):
         pct = 20 + int(60 * (i + 1) / total_work)
         _progress(pct, f"Analyzing {unit['name']}...")
-        rooms = analyze_rooms_in_unit(image, unit, model=detail_model)
-        all_rooms.extend(rooms)
+
+        # Gemini: room names, types, approximate bounding boxes
+        gemini_rooms = analyze_rooms_in_unit(image, unit, model=detail_model)
+
+        # CV: precise wall-aligned contours
+        cv_rooms = _cv_segment_unit(image, unit)
+        _logger.info(f"  {unit['name']}: Gemini found {len(gemini_rooms)} rooms, CV found {len(cv_rooms)} contours")
+
+        # Match: pair Gemini metadata with CV polygons
+        unit_offset = (unit["bbox_px"][0], unit["bbox_px"][1])
+        matched = _match_gemini_rooms_to_cv_contours(gemini_rooms, cv_rooms, unit_offset)
+        all_rooms.extend(matched)
 
     # Public spaces: use bbox as rectangle polygon, skip Pass 2
     for unit in public_units:
@@ -414,14 +527,6 @@ def run_furnished_pipeline(
             "polygon_px": poly,
             "printed_area_sqm": None,
         })
-
-    # Wall snapping: refine polygon vertices by snapping to nearest dark pixels
-    _progress(82, "Snapping polygons to walls...")
-    from backend.pipeline.wall_snapper import snap_polygon_to_walls
-    import cv2 as _cv2
-    gray = _cv2.cvtColor(image, _cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-    for room in all_rooms:
-        room["polygon_px"] = snap_polygon_to_walls(room["polygon_px"], gray, radius=40)
 
     # Compute geometry for all rooms
     _progress(85, "Computing room geometry...")
