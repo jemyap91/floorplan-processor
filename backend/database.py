@@ -17,10 +17,26 @@ class Database:
                 self.conn.execute("ALTER TABLE rooms ADD COLUMN fill_color_rgb TEXT")
             except sqlite3.OperationalError:
                 pass
+        try:
+            self.conn.execute("SELECT process_mode FROM projects LIMIT 1")
+        except sqlite3.OperationalError:
+            try:
+                self.conn.execute("ALTER TABLE projects ADD COLUMN process_mode TEXT")
+            except sqlite3.OperationalError:
+                pass
+        for col, coltype in [("unit_name", "TEXT"), ("printed_area_sqm", "REAL"), ("area_divergence_flag", "INTEGER")]:
+            try:
+                self.conn.execute(f"SELECT {col} FROM rooms LIMIT 1")
+            except sqlite3.OperationalError:
+                try:
+                    self.conn.execute(f"ALTER TABLE rooms ADD COLUMN {col} {coltype}")
+                except sqlite3.OperationalError:
+                    pass
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY, name TEXT, created_at TEXT,
-                pdf_path TEXT, scale_px_per_meter REAL, scale_source TEXT
+                pdf_path TEXT, scale_px_per_meter REAL, scale_source TEXT,
+                process_mode TEXT
             );
             CREATE TABLE IF NOT EXISTS rooms (
                 id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id),
@@ -28,7 +44,8 @@ class Database:
                 area_px REAL, perimeter_px REAL, area_sqm REAL, perimeter_m REAL,
                 boundary_lengths_px TEXT, boundary_lengths_m TEXT,
                 centroid_x REAL, centroid_y REAL, fill_color_rgb TEXT,
-                source TEXT, confidence REAL
+                source TEXT, confidence REAL,
+                unit_name TEXT, printed_area_sqm REAL, area_divergence_flag INTEGER
             );
             CREATE TABLE IF NOT EXISTS excluded_regions (
                 id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id),
@@ -42,21 +59,24 @@ class Database:
 
     def save_project(self, project: ProjectData):
         self.conn.execute(
-            "INSERT OR REPLACE INTO projects VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO projects VALUES (?, ?, ?, ?, ?, ?, ?)",
             (project.id, project.name, project.created_at.isoformat(),
-             project.pdf_path, project.scale_px_per_meter, project.scale_source))
+             project.pdf_path, project.scale_px_per_meter, project.scale_source,
+             project.process_mode))
         self.conn.commit()
 
     def get_project(self, project_id: str) -> ProjectData | None:
         row = self.conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         if not row: return None
         return ProjectData(id=row["id"], name=row["name"], pdf_path=row["pdf_path"],
-            scale_px_per_meter=row["scale_px_per_meter"], scale_source=row["scale_source"] or "manual")
+            scale_px_per_meter=row["scale_px_per_meter"], scale_source=row["scale_source"] or "manual",
+            process_mode=row["process_mode"] or "hybrid")
 
     def list_projects(self) -> list[ProjectData]:
         rows = self.conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
         return [ProjectData(id=r["id"], name=r["name"], pdf_path=r["pdf_path"],
-            scale_px_per_meter=r["scale_px_per_meter"], scale_source=r["scale_source"] or "manual") for r in rows]
+            scale_px_per_meter=r["scale_px_per_meter"], scale_source=r["scale_source"] or "manual",
+            process_mode=r["process_mode"] or "hybrid") for r in rows]
 
     def save_room(self, room: RoomData):
         self.conn.execute(
@@ -64,8 +84,9 @@ class Database:
                (id, project_id, name, room_type, boundary_polygon,
                 area_px, perimeter_px, area_sqm, perimeter_m,
                 boundary_lengths_px, boundary_lengths_m,
-                centroid_x, centroid_y, fill_color_rgb, source, confidence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                centroid_x, centroid_y, fill_color_rgb, source, confidence,
+                unit_name, printed_area_sqm, area_divergence_flag)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (room.id, room.project_id, room.name, room.room_type,
              json.dumps(room.boundary_polygon), room.area_px, room.perimeter_px,
              room.area_sqm, room.perimeter_m,
@@ -73,7 +94,8 @@ class Database:
              json.dumps(room.boundary_lengths_m) if room.boundary_lengths_m else None,
              room.centroid[0], room.centroid[1],
              json.dumps(room.fill_color_rgb) if room.fill_color_rgb else None,
-             room.source, room.confidence))
+             room.source, room.confidence,
+             room.unit_name, room.printed_area_sqm, int(room.area_divergence_flag)))
         self.conn.commit()
 
     def get_rooms(self, project_id: str) -> list[RoomData]:
@@ -87,7 +109,10 @@ class Database:
             boundary_lengths_m=json.loads(r["boundary_lengths_m"]) if r["boundary_lengths_m"] else None,
             centroid=(r["centroid_x"] or 0, r["centroid_y"] or 0),
             fill_color_rgb=json.loads(r["fill_color_rgb"]) if r["fill_color_rgb"] else None,
-            source=r["source"] or "cv", confidence=r["confidence"] or 0) for r in rows]
+            source=r["source"] or "cv", confidence=r["confidence"] or 0,
+            unit_name=r["unit_name"],
+            printed_area_sqm=r["printed_area_sqm"],
+            area_divergence_flag=bool(r["area_divergence_flag"]) if r["area_divergence_flag"] else False) for r in rows]
 
     def update_room(self, room: RoomData):
         self.save_room(room)
