@@ -11,6 +11,13 @@ import type { CanvasMode } from './components/FloorplanCanvas';
 
 type AppState = 'idle' | 'processing' | 'ready' | 'error';
 
+const MODE_LABELS: Record<string, { label: string; color: string }> = {
+  gemini: { label: 'Gemini AI', color: 'bg-violet-600/30 text-violet-400' },
+  hybrid: { label: 'CV + AI', color: 'bg-sky-600/30 text-sky-400' },
+  linedraw: { label: 'Line Drawing', color: 'bg-amber-600/30 text-amber-400' },
+  furnished: { label: 'Furnished', color: 'bg-emerald-600/30 text-emerald-400' },
+};
+
 function formatTimestamp(iso: string): string {
   const d = new Date(iso);
   return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })
@@ -49,6 +56,9 @@ export default function App() {
   const [newRoomPolygon, setNewRoomPolygon] = useState<number[][] | null>(null);
   const [newRoomName, setNewRoomName] = useState('');
   const [newRoomType, setNewRoomType] = useState('unknown');
+  const [filterColors, setFilterColors] = useState(true);
+  const [geminiModel, setGeminiModel] = useState<'flash' | 'pro'>('flash');
+  const [processMode, setProcessMode] = useState<string | null>(null);
 
   const selectedRoom = rooms.find((r) => r.id === selectedRoomId) || null;
   const imageUrl = projectId ? getImageUrl(projectId) : null;
@@ -81,10 +91,11 @@ export default function App() {
     }, 500);
 
     try {
-      const result = await processFloorplan(file, 0, mode, jobId);
+      const result = await processFloorplan(file, 0, mode, jobId, filterColors, geminiModel);
       setProjectId(result.project_id);
       setRooms(result.rooms);
       setScale(result.scale);
+      setProcessMode(mode);
       setPercent(100);
       setState('ready');
     } catch (err: any) {
@@ -94,7 +105,7 @@ export default function App() {
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = null;
     }
-  }, [mode]);
+  }, [mode, geminiModel]);
 
   const handleFileUpload = useCallback((file: File) => {
     // Check for duplicate filename
@@ -126,6 +137,7 @@ export default function App() {
         px_per_meter: project.scale_px_per_meter,
         source: project.scale_source,
       });
+      setProcessMode(project.process_mode || null);
       setState('ready');
     } catch (err: any) {
       setError(err.message || 'Failed to load project');
@@ -231,6 +243,7 @@ export default function App() {
     setSelectedRoomId(null);
     setScale(null);
     setError(null);
+    setProcessMode(null);
     setDuplicateWarning(null);
     setPendingFile(null);
     setDeleteConfirm(null);
@@ -253,25 +266,61 @@ export default function App() {
         <div className="text-center space-y-5 max-w-lg w-full px-4">
           <h1 className="text-2xl font-bold text-neutral-200">Floorplan Processor</h1>
           <p className="text-neutral-500">Drop a floorplan (PDF, PNG, JPG) or click to upload</p>
-          <div className="flex items-center justify-center gap-3">
-            <span className={`text-xs ${mode === 'hybrid' ? 'text-neutral-200' : 'text-neutral-600'}`}>CV + AI</span>
-            <button
-              onClick={() => setMode(mode === 'hybrid' ? 'gemini' : 'hybrid')}
-              className={`relative w-11 h-6 rounded-full transition-colors shrink-0 ${
-                mode === 'gemini' ? 'bg-violet-600' : 'bg-neutral-700'
-              }`}
-            >
-              <span className={`block w-4 h-4 rounded-full bg-white absolute top-1 transition-all ${
-                mode === 'gemini' ? 'left-6' : 'left-1'
-              }`} />
-            </button>
-            <span className={`text-xs ${mode === 'gemini' ? 'text-neutral-200' : 'text-neutral-600'}`}>Gemini AI</span>
+          <div className="flex items-center justify-center gap-2">
+            {([
+              { value: 'gemini' as ProcessMode, label: 'Gemini AI', color: 'bg-violet-600' },
+              { value: 'hybrid' as ProcessMode, label: 'CV + AI', color: 'bg-sky-600' },
+              { value: 'linedraw' as ProcessMode, label: 'Line Drawing', color: 'bg-amber-600' },
+              { value: 'furnished' as ProcessMode, label: 'Furnished', color: 'bg-emerald-600' },
+            ]).map((opt) => (
+              <button
+                key={opt.value}
+                onClick={() => setMode(opt.value)}
+                className={`px-3 py-1.5 text-xs rounded-full transition-colors ${
+                  mode === opt.value
+                    ? `${opt.color} text-white`
+                    : 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
           </div>
           <p className="text-neutral-600 text-xs">
-            {mode === 'gemini'
-              ? 'CV boundaries + Gemini room labelling (recommended)'
-              : 'CV boundaries + basic Gemini labelling'}
+            {mode === 'gemini' && 'CV boundaries + Gemini room labelling (recommended)'}
+            {mode === 'hybrid' && 'CV boundaries + basic Gemini labelling'}
+            {mode === 'linedraw' && 'Optimized for architectural line drawings without color fills'}
+            {mode === 'furnished' && 'Two-pass Gemini AI for furnished residential floorplans'}
           </p>
+          {(mode === 'gemini' || mode === 'furnished') && (
+            <div className="flex items-center justify-center gap-2">
+              <span className="text-neutral-500 text-xs">Model:</span>
+              {(['flash', 'pro'] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setGeminiModel(m)}
+                  className={`px-2.5 py-1 text-xs rounded-full transition-colors ${
+                    geminiModel === m
+                      ? 'bg-neutral-600 text-white'
+                      : 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700'
+                  }`}
+                >
+                  {m === 'flash' ? 'Flash (free)' : 'Pro (paid)'}
+                </button>
+              ))}
+            </div>
+          )}
+          {mode === 'linedraw' && (
+            <label className="flex items-center justify-center gap-2 text-xs text-neutral-400 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={filterColors}
+                onChange={(e) => setFilterColors(e.target.checked)}
+                className="w-3.5 h-3.5 rounded border-neutral-600 bg-neutral-800 accent-amber-500"
+              />
+              Filter colored elements (grid lines, doors)
+            </label>
+          )}
           <label className="inline-block px-6 py-3 bg-sky-600 text-white rounded-lg cursor-pointer hover:bg-sky-500">
             Select File
             <input
@@ -409,9 +458,14 @@ export default function App() {
                         {formatTimestamp(p.created_at)}
                         <span className="text-neutral-600"> ({timeAgo(p.created_at)})</span>
                       </div>
-                      <div className="text-neutral-600 text-xs mt-0.5">
-                        {p.room_count} room{p.room_count !== 1 ? 's' : ''}
-                        {p.scale_px_per_meter != null && ` · ${p.scale_px_per_meter.toFixed(1)} px/m`}
+                      <div className="text-neutral-600 text-xs mt-0.5 flex items-center gap-1.5">
+                        <span>{p.room_count} room{p.room_count !== 1 ? 's' : ''}</span>
+                        {p.scale_px_per_meter != null && <span>· {p.scale_px_per_meter.toFixed(1)} px/m</span>}
+                        {p.process_mode && MODE_LABELS[p.process_mode] && (
+                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${MODE_LABELS[p.process_mode].color}`}>
+                            {MODE_LABELS[p.process_mode].label}
+                          </span>
+                        )}
                       </div>
                     </button>
                     <button
@@ -457,6 +511,7 @@ export default function App() {
         onRoomSelect={setSelectedRoomId}
         scale={scale}
         projectId={projectId}
+        processMode={processMode}
         onBack={handleBackToHome}
       />
       <div className="relative flex-1 flex flex-col min-w-0">
