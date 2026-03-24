@@ -6,16 +6,24 @@ const ROOM_COLORS = [
   '#facc15', '#2dd4bf', '#fb923c', '#818cf8', '#e879f9',
 ];
 
+const MODE_LABELS: Record<string, { label: string; color: string }> = {
+  gemini: { label: 'Gemini AI', color: 'bg-violet-600/30 text-violet-400' },
+  hybrid: { label: 'CV + AI', color: 'bg-sky-600/30 text-sky-400' },
+  linedraw: { label: 'Line Drawing', color: 'bg-amber-600/30 text-amber-400' },
+  furnished: { label: 'Furnished', color: 'bg-emerald-600/30 text-emerald-400' },
+};
+
 interface RoomSidebarProps {
   rooms: Room[];
   selectedRoomId: string | null;
   onRoomSelect: (roomId: string) => void;
   scale: { px_per_meter: number | null; source: string } | null;
   projectId: string | null;
+  processMode: string | null;
   onBack?: () => void;
 }
 
-export function RoomSidebar({ rooms, selectedRoomId, onRoomSelect, scale, projectId, onBack }: RoomSidebarProps) {
+export function RoomSidebar({ rooms, selectedRoomId, onRoomSelect, scale, projectId, processMode, onBack }: RoomSidebarProps) {
   const totalArea = rooms.reduce((sum, r) => sum + (r.area_sqm || 0), 0);
   const [exporting, setExporting] = useState(false);
 
@@ -70,6 +78,9 @@ export function RoomSidebar({ rooms, selectedRoomId, onRoomSelect, scale, projec
             style={{ borderLeft: `3px solid ${ROOM_COLORS[i % ROOM_COLORS.length]}` }}
           >
             <div className="text-sm text-neutral-200">{room.name || 'Unnamed'}</div>
+            {room.unit_name && (
+              <div className="text-xs text-neutral-600">{room.unit_name}</div>
+            )}
             <div className="text-xs text-neutral-500">
               {room.area_sqm ? `${room.area_sqm.toFixed(1)} m²` : '—'}
               {room.perimeter_m ? ` · ${room.perimeter_m.toFixed(1)}m` : ''}
@@ -81,6 +92,14 @@ export function RoomSidebar({ rooms, selectedRoomId, onRoomSelect, scale, projec
         ))}
       </div>
       <div className="p-3 border-t border-neutral-800 text-xs text-neutral-500 space-y-1">
+        {processMode && MODE_LABELS[processMode] && (
+          <div className="flex items-center gap-1.5">
+            <span>Mode:</span>
+            <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${MODE_LABELS[processMode].color}`}>
+              {MODE_LABELS[processMode].label}
+            </span>
+          </div>
+        )}
         <div>
           Scale: {scale?.px_per_meter
             ? `${(1 / scale.px_per_meter).toFixed(4)}m/px (${scale.source})`
