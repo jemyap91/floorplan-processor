@@ -81,24 +81,27 @@ def _call_gemini_with_model(image: np.ndarray, prompt: str, model: str | None = 
 
 def _build_pass1_prompt() -> str:
     """Build Gemini prompt for identifying apartment units and public spaces."""
-    return """You are analyzing a furnished architectural floorplan. Identify ALL distinct apartment units and public spaces visible.
+    return """You are analyzing a furnished architectural floorplan drawing. Identify ALL distinct apartment units and public/shared spaces.
 
 For each unit/space, provide:
-1. **name**: The unit label as written on the plan (e.g. "Unit 1A", "Apartment 201"). For public areas use the label (e.g. "Lobby", "Corridor").
+1. **name**: The unit label as written on the plan (e.g. "UNIT 20.01"). For public areas use the label (e.g. "Lobby", "Stair E").
 2. **type**: One of: residential, public, lobby, stairwell, corridor, utility, mechanical, elevator
 3. **bbox**: Normalized bounding box [x, y, width, height] where values are 0.0-1.0 relative to image dimensions. (x,y) is the top-left corner.
 
-IMPORTANT:
-- Include ALL apartment units, even if they look similar
-- Include public spaces: lobbies, corridors, stairwells, elevators, utility rooms
-- bbox should tightly enclose each unit/space
-- Do NOT include title blocks, legends, notes, or margins
+CRITICAL INSTRUCTIONS FOR BOUNDING BOXES:
+- The bbox must enclose the ENTIRE FLOOR AREA of the unit — all its rooms, walls, corridors, and balconies.
+- Do NOT just box the unit's text label. Box the full physical space the unit occupies on the plan.
+- Residential units typically occupy large rectangular areas containing multiple rooms (bedrooms, kitchen, bathrooms, living areas).
+- Each residential unit's bbox should be large enough to contain all rooms within that apartment.
+- Public spaces may be smaller (corridors, elevator shafts, utility rooms).
+- Do NOT include title blocks, legends, notes, or margins — only the actual building floor area.
+- Bboxes for adjacent units should NOT significantly overlap.
 
 Return ONLY valid JSON:
 ```json
 {
   "units": [
-    {"name": "Unit 1A", "type": "residential", "bbox": [0.05, 0.1, 0.4, 0.45]},
+    {"name": "UNIT 20.01", "type": "residential", "bbox": [0.05, 0.1, 0.4, 0.45]},
     {"name": "Lobby", "type": "lobby", "bbox": [0.45, 0.3, 0.15, 0.2]}
   ]
 }

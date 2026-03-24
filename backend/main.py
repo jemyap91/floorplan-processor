@@ -597,39 +597,50 @@ def _process_furnished_mode(
 
     rooms_out = []
     for raw in raw_rooms:
-        polygon_coords = raw.get("boundary_polygon", [])
+        polygon_coords = raw.get("polygon_px", [])
         if not polygon_coords:
             continue
+
+        # Convert polygon to list-of-lists for JSON serialization
+        boundary_polygon = [list(pt) for pt in polygon_coords]
+
+        # Compute boundary segment lengths
+        boundary_lengths_px = []
+        for i in range(len(polygon_coords)):
+            p1 = polygon_coords[i]
+            p2 = polygon_coords[(i + 1) % len(polygon_coords)]
+            length = ((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2) ** 0.5
+            boundary_lengths_px.append(length)
 
         real = {}
         if px_per_meter:
             real = to_real_measurements(
                 raw["area_px"],
                 raw["perimeter_px"],
-                raw["boundary_lengths_px"],
+                boundary_lengths_px,
                 px_per_meter,
             )
 
-        fill_color = _sample_fill_color(image, raw["centroid"], raw.get("polygon"))
+        fill_color = _sample_fill_color(image, raw["centroid"], polygon_coords)
 
         room = RoomData(
             project_id=project.id,
             name=raw["name"],
             room_type=raw.get("type", "unknown"),
-            boundary_polygon=polygon_coords,
+            boundary_polygon=boundary_polygon,
             area_px=raw["area_px"],
             perimeter_px=raw["perimeter_px"],
             centroid=raw["centroid"],
-            boundary_lengths_px=raw["boundary_lengths_px"],
+            boundary_lengths_px=boundary_lengths_px,
             area_sqm=real.get("area_sqm"),
             perimeter_m=real.get("perimeter_m"),
             boundary_lengths_m=real.get("boundary_lengths_m"),
             fill_color_rgb=fill_color,
             source="furnished",
-            confidence=float(raw.get("confidence", 0.5)),
+            confidence=0.7,
             unit_name=raw.get("unit_name"),
             printed_area_sqm=raw.get("printed_area_sqm"),
-            area_divergence_flag=raw.get("area_divergence_flag", False),
+            area_divergence_flag=raw.get("area_divergence", False),
         )
         db.save_room(room)
         rooms_out.append(room.model_dump())
