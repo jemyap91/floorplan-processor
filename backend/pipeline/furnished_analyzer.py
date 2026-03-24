@@ -231,6 +231,7 @@ def analyze_rooms_in_unit(image: np.ndarray, unit: dict, model: str | None = Non
     try:
         x, y, w, h = unit["bbox_px"]
         img_h, img_w = image.shape[:2]
+        _logger.info(f"Pass 2: analyzing rooms in '{unit['name']}' bbox=({x},{y},{w},{h})")
         # Crop the unit region
         x2 = min(x + w, img_w)
         y2 = min(y + h, img_h)
