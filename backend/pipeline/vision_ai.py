@@ -18,7 +18,7 @@ import logging as _logging
 _logger = _logging.getLogger(__name__)
 
 
-def _call_gemini(image: np.ndarray, prompt: str) -> str:
+def _call_gemini(image: np.ndarray, prompt: str, model: str | None = None) -> str:
     """Call Google Gemini Vision API with retry on rate limit.
 
     Uses the new google-genai SDK (replaces deprecated google.generativeai).
@@ -32,8 +32,9 @@ def _call_gemini(image: np.ndarray, prompt: str) -> str:
     client = genai.Client(api_key=api_key)
     pil_image = Image.fromarray(image)
 
-    models_to_try = [GEMINI_MODEL]
-    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+    target_model = model or GEMINI_MODEL
+    models_to_try = [target_model]
+    if not model and GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != target_model:
         models_to_try.append(GEMINI_FALLBACK_MODEL)
 
     last_error = None
@@ -58,9 +59,9 @@ def _call_gemini(image: np.ndarray, prompt: str) -> str:
     raise last_error
 
 
-def _call_vision(image: np.ndarray, prompt: str, **kwargs) -> str:
+def _call_vision(image: np.ndarray, prompt: str, model: str | None = None, **kwargs) -> str:
     """Call Gemini vision API."""
-    return _call_gemini(image, prompt)
+    return _call_gemini(image, prompt, model=model)
 
 def _build_classification_prompt() -> str:
     return """You are analyzing an architectural floorplan drawing. These drawings typically have:
