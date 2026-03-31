@@ -2,7 +2,7 @@
 import cv2
 import numpy as np
 
-def detect_walls(binary: np.ndarray, min_wall_length: int = 30, wall_thickness_range: tuple = (3, 30)) -> dict:
+def detect_walls(binary: np.ndarray, min_wall_length: int = 30, wall_thickness_range: tuple = (3, 30), max_line_gap: int = 10) -> dict:
     h, w = binary.shape
     wall_mask = np.zeros_like(binary)
     h_kernel_len = max(min_wall_length, w // 30)
@@ -13,7 +13,7 @@ def detect_walls(binary: np.ndarray, min_wall_length: int = 30, wall_thickness_r
     v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
     wall_mask = cv2.bitwise_or(h_lines, v_lines)
     segments = []
-    lines = cv2.HoughLinesP(wall_mask, rho=1, theta=np.pi/180, threshold=min_wall_length, minLineLength=min_wall_length, maxLineGap=10)
+    lines = cv2.HoughLinesP(wall_mask, rho=1, theta=np.pi/180, threshold=min_wall_length, minLineLength=min_wall_length, maxLineGap=max_line_gap)
     if lines is not None:
         for line in lines:
             x1, y1, x2, y2 = line[0]

@@ -69,12 +69,14 @@ class Database:
         row = self.conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         if not row: return None
         return ProjectData(id=row["id"], name=row["name"], pdf_path=row["pdf_path"],
+            created_at=row["created_at"],
             scale_px_per_meter=row["scale_px_per_meter"], scale_source=row["scale_source"] or "manual",
             process_mode=row["process_mode"] or "hybrid")
 
     def list_projects(self) -> list[ProjectData]:
         rows = self.conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
         return [ProjectData(id=r["id"], name=r["name"], pdf_path=r["pdf_path"],
+            created_at=r["created_at"],
             scale_px_per_meter=r["scale_px_per_meter"], scale_source=r["scale_source"] or "manual",
             process_mode=r["process_mode"] or "hybrid") for r in rows]
 

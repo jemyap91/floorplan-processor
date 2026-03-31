@@ -13,6 +13,7 @@ def segment_rooms(
     min_area_ratio: float = 0.001,
     simplify_tolerance: float = 2.0,
     min_compactness: float = 0.03,
+    min_aspect_ratio: float = 0.1,
     close_gap_px: int = 5,
     excluded_regions: list | None = None,
 ) -> list[dict]:
@@ -86,7 +87,7 @@ def segment_rooms(
         _, (bw, bh), _ = cv2.minAreaRect(contour)
         if bw > 0 and bh > 0:
             aspect = min(bw, bh) / max(bw, bh)
-            if aspect < 0.1:
+            if aspect < min_aspect_ratio:
                 continue
 
         epsilon = simplify_tolerance

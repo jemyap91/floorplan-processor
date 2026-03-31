@@ -566,17 +566,10 @@ def _process_furnished_mode(
     _update=lambda p, m: None,
     gemini_model: str = "flash",
 ) -> list[dict]:
-    """Furnished residential pipeline — Gemini two-pass room detection."""
+    """Furnished residential pipeline — CV-first room detection with Gemini labeling."""
     from backend.pipeline.furnished_analyzer import run_furnished_pipeline
 
-    model_map = {
-        "flash": "gemini-2.5-flash",
-        "pro": "gemini-2.5-pro",
-    }
-    detail_model = model_map.get(gemini_model, "gemini-2.5-flash")
-    flash_model = "gemini-2.5-flash"
-
-    _update(10, "Analyzing floor plan (Pass 1 — identifying units)...")
+    _update(10, "Analyzing floor plan (CV room detection)...")
 
     debug_dir = os.path.join(os.path.dirname(project.pdf_path or "."), "debug")
 
@@ -584,13 +577,14 @@ def _process_furnished_mode(
         mapped = 10 + int(percent * 0.7)
         _update(mapped, message)
 
+    model_map = {"flash": "gemini-2.5-flash", "pro": "gemini-2.5-pro"}
+    model_name = model_map.get(gemini_model, "gemini-2.5-flash")
+
     raw_rooms = run_furnished_pipeline(
         image,
-        flash_model=flash_model,
-        detail_model=detail_model,
-        px_per_meter=px_per_meter,
         debug_dir=debug_dir,
         progress_cb=_pipeline_progress,
+        gemini_model=model_name,
     )
 
     _update(80, f"Saving {len(raw_rooms)} rooms...")

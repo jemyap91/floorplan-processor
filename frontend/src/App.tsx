@@ -287,10 +287,10 @@ export default function App() {
             ))}
           </div>
           <p className="text-neutral-600 text-xs">
-            {mode === 'gemini' && 'CV boundaries + Gemini room labelling (recommended)'}
-            {mode === 'hybrid' && 'CV boundaries + basic Gemini labelling'}
-            {mode === 'linedraw' && 'Optimized for architectural line drawings without color fills'}
-            {mode === 'furnished' && 'Two-pass Gemini AI for furnished residential floorplans'}
+            {mode === 'gemini' && 'Best for clean, simple floorplans with clear room labels'}
+            {mode === 'hybrid' && 'Best for unfurnished plans with strong black walls and clear room boundaries'}
+            {mode === 'linedraw' && 'Best for schematic plans where rooms are filled with distinct colors or hatching'}
+            {mode === 'furnished' && 'Best for furnished residential plans with furniture, mixed line weights, and annotations'}
           </p>
           {(mode === 'gemini' || mode === 'furnished') && (
             <div className="flex items-center justify-center gap-2">

@@ -150,6 +150,67 @@ def classify_regions(image: np.ndarray, provider: str | None = None) -> dict:
         "excluded_regions": [],
     }
 
+def detect_building_bbox(
+    image: np.ndarray,
+    model: str | None = None,
+) -> tuple[int, int, int, int]:
+    """Use Gemini to detect the building footprint bounding box.
+
+    Asks Gemini to identify the actual building floor plan area, excluding
+    title blocks, dimension annotations, margins, grid labels, and legends.
+
+    Returns (x1, y1, x2, y2) in pixel coordinates. Falls back to full image
+    if Gemini fails or returns invalid data.
+    """
+    h, w = image.shape[:2]
+
+    prompt = """You are analyzing an architectural floor plan drawing. The image contains:
+- The **actual building floor plan** (rooms, walls, corridors, stairs)
+- **Non-building elements**: title blocks, revision tables, dimension lines, grid labels (circled numbers like ①②③), site boundary lines, legends, notes, margins
+
+Return the bounding box of ONLY the actual building structure — the outermost walls of the building.
+
+EXCLUDE from the bounding box:
+- Title blocks and revision tables (usually right side or bottom)
+- Dimension lines and measurements that extend beyond the walls
+- Grid reference labels (circled letters/numbers at edges: A, B, C, 1, 2, 3)
+- Site boundary lines (dashed lines outside the building)
+- Legends, notes, key plans, logos
+- Empty margins
+
+Return ONLY valid JSON with normalized coordinates (0.0 to 1.0):
+```json
+{"x1": 0.1, "y1": 0.15, "x2": 0.75, "y2": 0.85}
+```
+Where (x1,y1) is the top-left corner and (x2,y2) is the bottom-right corner of the building footprint."""
+
+    try:
+        response_text = _call_vision(image, prompt, model=model)
+        result = _parse_json_response(response_text)
+        if result and "x1" in result:
+            x1 = float(result["x1"])
+            y1 = float(result["y1"])
+            x2 = float(result["x2"])
+            y2 = float(result["y2"])
+            # Validate normalized coords
+            if 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1:
+                px1 = max(0, int(x1 * w))
+                py1 = max(0, int(y1 * h))
+                px2 = min(w, int(x2 * w))
+                py2 = min(h, int(y2 * h))
+                _logger.info(
+                    f"Gemini building bbox: ({px1},{py1})-({px2},{py2}) "
+                    f"= {px2-px1}x{py2-py1} of {w}x{h}"
+                )
+                return (px1, py1, px2, py2)
+            _logger.warning(f"Gemini returned invalid bbox coords: {result}")
+    except Exception as e:
+        _logger.error(f"detect_building_bbox failed: {e}")
+
+    _logger.warning("Gemini building bbox failed, falling back to full image")
+    return (0, 0, w, h)
+
+
 def _build_room_listing_prompt() -> str:
     return """You are an expert architectural floor plan analyst. List every distinct room and enclosed space visible on this floor plan.
 

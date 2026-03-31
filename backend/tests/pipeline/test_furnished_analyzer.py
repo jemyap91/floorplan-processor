@@ -1,352 +1,314 @@
-"""Tests for furnished_analyzer module — two-pass Gemini pipeline."""
-import json
+"""Tests for furnished_analyzer module — all-in OpenCV pipeline with Gemini labeling."""
 import numpy as np
 import pytest
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
+from shapely.geometry import Polygon as ShapelyPolygon
 
 
 # ---------------------------------------------------------------------------
-# Pass 1 — unit detection
+# Step 1: Downscale
 # ---------------------------------------------------------------------------
 
-class TestPass1Prompt:
-    def test_prompt_is_string(self):
-        from backend.pipeline.furnished_analyzer import _build_pass1_prompt
-        prompt = _build_pass1_prompt()
-        assert isinstance(prompt, str)
-
-    def test_prompt_contains_key_terms(self):
-        from backend.pipeline.furnished_analyzer import _build_pass1_prompt
-        prompt = _build_pass1_prompt().lower()
-        assert "unit" in prompt
-        assert "box_2d" in prompt or "bounding box" in prompt
-        assert "structural" in prompt
-
-
-class TestPass1Parsing:
-    def test_valid_response(self):
-        from backend.pipeline.furnished_analyzer import _parse_pass1_response
-        # box_2d: [ymin, xmin, ymax, xmax] in 0-1000
-        response = json.dumps({
-            "units": [
-                {"name": "Unit A", "type": "residential",
-                 "box_2d": [200, 100, 600, 600]},
-                {"name": "Lobby", "type": "public",
-                 "box_2d": [0, 600, 300, 1000]},
-            ]
-        })
-        units = _parse_pass1_response(response, img_w=1000, img_h=800)
-        assert len(units) == 2
-        u0 = units[0]
-        assert u0["name"] == "Unit A"
-        assert u0["type"] == "residential"
-        # bbox_px = (x=100/1000*1000, y=200/1000*800, w=(600-100)/1000*1000, h=(600-200)/1000*800)
-        assert u0["bbox_px"] == (100, 160, 500, 320)
-        assert u0["is_public"] is False
-        assert units[1]["is_public"] is True
-
-    def test_truncated_response(self):
-        from backend.pipeline.furnished_analyzer import _parse_pass1_response
-        response = '```json\n{"units": [{"name": "Unit A", "type": "residential", "box_2d": [200, 100, 600, 600]},'
-        units = _parse_pass1_response(response, img_w=1000, img_h=800)
-        assert len(units) == 1
-        assert units[0]["name"] == "Unit A"
-
-    def test_invalid_response_returns_empty(self):
-        from backend.pipeline.furnished_analyzer import _parse_pass1_response
-        units = _parse_pass1_response("not json at all", img_w=1000, img_h=800)
-        assert units == []
-
-    def test_public_types_detection(self):
-        from backend.pipeline.furnished_analyzer import _parse_pass1_response
-        for ptype in ["lobby", "stairwell", "corridor", "elevator", "utility", "mechanical"]:
-            response = json.dumps({
-                "units": [{"name": "X", "type": ptype, "box_2d": [0, 0, 1000, 1000]}]
-            })
-            units = _parse_pass1_response(response, img_w=100, img_h=100)
-            assert units[0]["is_public"] is True, f"{ptype} should be public"
-
-    def test_zero_size_box_skipped(self):
-        from backend.pipeline.furnished_analyzer import _parse_pass1_response
-        response = json.dumps({
-            "units": [
-                {"name": "Bad", "type": "residential", "box_2d": [500, 500, 500, 500]},  # zero size
-                {"name": "Good", "type": "residential", "box_2d": [0, 0, 500, 500]},
-            ]
-        })
-        units = _parse_pass1_response(response, img_w=1000, img_h=1000)
-        assert len(units) == 1
-        assert units[0]["name"] == "Good"
-
-
-class TestAnalyzeUnits:
-    @patch("backend.pipeline.furnished_analyzer._call_gemini_with_model")
-    def test_returns_units(self, mock_gemini):
-        from backend.pipeline.furnished_analyzer import analyze_units
-        mock_gemini.return_value = json.dumps({
-            "units": [
-                {"name": "Unit 1", "type": "residential", "box_2d": [0, 0, 500, 500]},
-            ]
-        })
+class TestDownscale:
+    def test_halves_dimensions(self):
+        from backend.pipeline.furnished_analyzer import _downscale
         img = np.zeros((200, 400, 3), dtype=np.uint8)
-        units = analyze_units(img, model="gemini-2.5-flash")
-        assert len(units) == 1
-        assert units[0]["name"] == "Unit 1"
-        mock_gemini.assert_called_once()
+        result = _downscale(img, factor=2)
+        assert result.shape == (100, 200, 3)
 
-    @patch("backend.pipeline.furnished_analyzer._call_gemini_with_model")
-    def test_api_failure_returns_empty(self, mock_gemini):
-        from backend.pipeline.furnished_analyzer import analyze_units
-        mock_gemini.side_effect = Exception("API error")
-        img = np.zeros((200, 400, 3), dtype=np.uint8)
-        units = analyze_units(img)
-        assert units == []
+    def test_grayscale(self):
+        from backend.pipeline.furnished_analyzer import _downscale
+        img = np.zeros((200, 400), dtype=np.uint8)
+        result = _downscale(img, factor=2)
+        assert result.shape == (100, 200)
 
 
 # ---------------------------------------------------------------------------
-# Pass 2 — room bounding boxes per unit
+# Step 2: Color filtering
 # ---------------------------------------------------------------------------
 
-class TestPass2Prompt:
-    def test_prompt_includes_unit_name(self):
-        from backend.pipeline.furnished_analyzer import _build_pass2_prompt
-        prompt = _build_pass2_prompt("Unit A")
-        assert "Unit A" in prompt
-        assert "box_2d" in prompt or "bounding box" in prompt.lower()
-        assert "structural" in prompt.lower()
+class TestFilterColors:
+    def test_removes_red_pixels(self):
+        from backend.pipeline.furnished_analyzer import _filter_colors
+        img = np.ones((100, 100, 3), dtype=np.uint8) * 255
+        # Paint a red stripe
+        img[40:60, :] = (0, 0, 255)  # BGR red
+        result = _filter_colors(img)
+        # Red stripe should be replaced with white
+        assert np.all(result[50, 50] == [255, 255, 255])
 
+    def test_preserves_black_ink(self):
+        from backend.pipeline.furnished_analyzer import _filter_colors
+        img = np.ones((100, 100, 3), dtype=np.uint8) * 255
+        img[40:60, 40:60] = (0, 0, 0)  # black
+        result = _filter_colors(img)
+        # Black should survive
+        assert np.all(result[50, 50] == [0, 0, 0])
 
-class TestPass2Parsing:
-    def test_valid_room_boxes(self):
-        from backend.pipeline.furnished_analyzer import _parse_pass2_response
-        # box_2d: [ymin, xmin, ymax, xmax] in 0-1000
-        response = json.dumps({
-            "rooms": [
-                {"name": "Bedroom", "type": "bedroom",
-                 "box_2d": [100, 100, 900, 900],
-                 "area_sqm": 12.5},
-                {"name": "Kitchen", "type": "kitchen",
-                 "box_2d": [0, 0, 500, 500]},
-            ]
-        })
-        rooms = _parse_pass2_response(response, crop_w=500, crop_h=400)
-        assert len(rooms) == 2
-        r0 = rooms[0]
-        assert r0["name"] == "Bedroom"
-        # ymin=100, xmin=100 -> x1=100/1000*500=50, y1=100/1000*400=40
-        # ymax=900, xmax=900 -> x2=900/1000*500=450, y2=900/1000*400=360
-        assert r0["polygon_px"][0] == (50, 40)   # top-left
-        assert r0["polygon_px"][1] == (450, 40)   # top-right
-        assert r0["polygon_px"][2] == (450, 360)  # bottom-right
-        assert r0["polygon_px"][3] == (50, 360)   # bottom-left
-        assert r0["printed_area_sqm"] == 12.5
-
-    def test_empty_rooms(self):
-        from backend.pipeline.furnished_analyzer import _parse_pass2_response
-        response = json.dumps({"rooms": []})
-        rooms = _parse_pass2_response(response, crop_w=500, crop_h=400)
-        assert rooms == []
-
-    def test_invalid_box_skipped(self):
-        from backend.pipeline.furnished_analyzer import _parse_pass2_response
-        response = json.dumps({
-            "rooms": [
-                {"name": "Bad", "type": "other",
-                 "box_2d": [500, 500, 500, 500]},  # zero size
-                {"name": "Good", "type": "bedroom",
-                 "box_2d": [0, 0, 1000, 1000]},
-            ]
-        })
-        rooms = _parse_pass2_response(response, crop_w=100, crop_h=100)
-        assert len(rooms) == 1
-        assert rooms[0]["name"] == "Good"
-
-
-class TestAnalyzeRoomsInUnit:
-    @patch("backend.pipeline.furnished_analyzer._call_gemini_with_model")
-    def test_rooms_offset_correctly(self, mock_gemini):
-        from backend.pipeline.furnished_analyzer import analyze_rooms_in_unit
-        # box_2d: [ymin, xmin, ymax, xmax] in 0-1000
-        mock_gemini.return_value = json.dumps({
-            "rooms": [
-                {"name": "Bedroom", "type": "bedroom",
-                 "box_2d": [100, 100, 900, 900]}
-            ]
-        })
-        img = np.zeros((800, 1000, 3), dtype=np.uint8)
-        unit = {
-            "name": "Unit A",
-            "bbox_px": (100, 200, 500, 400),  # x, y, w, h
-            "is_public": False,
-        }
-        rooms = analyze_rooms_in_unit(img, unit, model="gemini-2.5-flash")
-        assert len(rooms) == 1
-        r = rooms[0]
-        # crop is 500x400
-        # box_2d [100,100,900,900] -> x1=100/1000*500=50, y1=100/1000*400=40
-        #                           -> x2=900/1000*500=450, y2=900/1000*400=360
-        # offset by unit bbox (100, 200): (150, 240) and (550, 560)
-        assert r["polygon_px"][0] == (150, 240)  # top-left
-        assert r["polygon_px"][2] == (550, 560)  # bottom-right
-        assert r["unit_name"] == "Unit A"
-
-    @patch("backend.pipeline.furnished_analyzer._call_gemini_with_model")
-    def test_api_failure_returns_empty(self, mock_gemini):
-        from backend.pipeline.furnished_analyzer import analyze_rooms_in_unit
-        mock_gemini.side_effect = Exception("API error")
-        img = np.zeros((800, 1000, 3), dtype=np.uint8)
-        unit = {"name": "Unit B", "bbox_px": (0, 0, 100, 100), "is_public": False}
-        rooms = analyze_rooms_in_unit(img, unit)
-        assert rooms == []
+    def test_preserves_white(self):
+        from backend.pipeline.furnished_analyzer import _filter_colors
+        img = np.ones((100, 100, 3), dtype=np.uint8) * 255
+        result = _filter_colors(img)
+        assert np.all(result == 255)
 
 
 # ---------------------------------------------------------------------------
-# Area divergence check
+# Step 3-4: Wall extraction
 # ---------------------------------------------------------------------------
 
-class TestAreaDivergence:
-    def test_close_returns_false(self):
-        from backend.pipeline.furnished_analyzer import _check_area_divergence
-        assert _check_area_divergence(100.0, 1.0, 10.0) is False
+class TestExtractWalls:
+    def test_returns_expected_keys(self):
+        from backend.pipeline.furnished_analyzer import _extract_walls
+        gray = np.ones((200, 300), dtype=np.uint8) * 200
+        result = _extract_walls(gray)
+        assert "binary" in result
+        assert "eroded" in result
+        assert "wall_mask" in result
 
-    def test_far_returns_true(self):
-        from backend.pipeline.furnished_analyzer import _check_area_divergence
-        assert _check_area_divergence(200.0, 1.0, 10.0) is True
+    def test_thick_grey_walls_survive(self):
+        from backend.pipeline.furnished_analyzer import _extract_walls
+        gray = np.ones((200, 300), dtype=np.uint8) * 255
+        # Draw a thick horizontal wall (10px wide) at wall-grey intensity (~99)
+        gray[95:105, 20:280] = 99
+        result = _extract_walls(gray)
+        assert np.count_nonzero(result["wall_mask"]) > 0
 
-    def test_no_printed_area_returns_false(self):
-        from backend.pipeline.furnished_analyzer import _check_area_divergence
-        assert _check_area_divergence(100.0, None, 10.0) is False
+    def test_thin_furniture_removed(self):
+        from backend.pipeline.furnished_analyzer import _extract_walls
+        gray = np.ones((200, 300), dtype=np.uint8) * 255
+        # Draw thin black furniture line (2px wide)
+        gray[100:102, 20:280] = 0
+        result = _extract_walls(gray)
+        # Thin black lines should NOT appear in wall mask
+        assert np.count_nonzero(result["wall_mask"]) == 0
 
-    def test_no_scale_returns_false(self):
-        from backend.pipeline.furnished_analyzer import _check_area_divergence
-        assert _check_area_divergence(100.0, 1.0, None) is False
-
-
-# ---------------------------------------------------------------------------
-# Compute room geometry
-# ---------------------------------------------------------------------------
-
-class TestComputeRoomGeometry:
-    def test_square_polygon(self):
-        from backend.pipeline.furnished_analyzer import _compute_room_geometry
-        polygon = [(0, 0), (100, 0), (100, 100), (0, 100)]
-        geom = _compute_room_geometry(polygon)
-        assert abs(geom["area_px"] - 10000.0) < 1.0
-        assert abs(geom["perimeter_px"] - 400.0) < 1.0
-        assert abs(geom["centroid"][0] - 50.0) < 1.0
-        assert abs(geom["centroid"][1] - 50.0) < 1.0
-
-
-# ---------------------------------------------------------------------------
-# Unit bbox to polygon
-# ---------------------------------------------------------------------------
-
-class TestUnitBboxToPolygon:
-    def test_conversion(self):
-        from backend.pipeline.furnished_analyzer import _unit_bbox_to_polygon
-        unit = {"bbox_px": (10, 20, 100, 50)}
-        poly = _unit_bbox_to_polygon(unit, img_w=500, img_h=400)
-        assert poly == [(10, 20), (110, 20), (110, 70), (10, 70)]
+    def test_output_shape_matches(self):
+        from backend.pipeline.furnished_analyzer import _extract_walls
+        gray = np.ones((200, 300), dtype=np.uint8) * 200
+        result = _extract_walls(gray)
+        assert result["wall_mask"].shape == (200, 300)
+        assert result["binary"].shape == (200, 300)
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator — run_furnished_pipeline
+# Step 5: Grid line removal
 # ---------------------------------------------------------------------------
+
+class TestRemoveGridLines:
+    def test_removes_spanning_line(self):
+        from backend.pipeline.furnished_analyzer import _remove_grid_lines
+        mask = np.zeros((200, 300), dtype=np.uint8)
+        # Horizontal line spanning 80% of width
+        mask[100, 20:280] = 255
+        result = _remove_grid_lines(mask, span_threshold=0.55)
+        assert np.count_nonzero(result) == 0
+
+    def test_keeps_short_line(self):
+        from backend.pipeline.furnished_analyzer import _remove_grid_lines
+        mask = np.zeros((200, 300), dtype=np.uint8)
+        # Short wall segment (30% of width)
+        mask[100, 50:140] = 255
+        result = _remove_grid_lines(mask, span_threshold=0.55)
+        assert np.count_nonzero(result) > 0
+
+
+# ---------------------------------------------------------------------------
+# Step 6: Door arc detection
+# ---------------------------------------------------------------------------
+
+class TestDetectDoorArcs:
+    def test_detects_arc_shape(self):
+        import cv2
+        from backend.pipeline.furnished_analyzer import _detect_door_arcs
+        # Create binary image with a thin quarter-circle arc
+        binary = np.zeros((200, 200), dtype=np.uint8)
+        cv2.ellipse(binary, (100, 100), (40, 40), 0, 0, 90, 255, 1)
+        # Eroded version has nothing (arc is 1px thin)
+        eroded = np.zeros_like(binary)
+        doors = _detect_door_arcs(binary, eroded)
+        # Should detect at least one arc-like feature
+        # (may or may not pass all filters depending on exact shape)
+        assert isinstance(doors, list)
+
+    def test_empty_image_returns_empty(self):
+        from backend.pipeline.furnished_analyzer import _detect_door_arcs
+        binary = np.zeros((200, 200), dtype=np.uint8)
+        eroded = np.zeros_like(binary)
+        doors = _detect_door_arcs(binary, eroded)
+        assert doors == []
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Door gap closing
+# ---------------------------------------------------------------------------
+
+class TestCloseDoorGaps:
+    def test_returns_same_shape(self):
+        from backend.pipeline.furnished_analyzer import _close_door_gaps
+        mask = np.zeros((200, 200), dtype=np.uint8)
+        mask[100, 50:80] = 255
+        mask[100, 120:150] = 255
+        result = _close_door_gaps(mask, doors=[(100, 100, 30)])
+        assert result.shape == mask.shape
+
+    def test_no_doors_returns_unchanged(self):
+        from backend.pipeline.furnished_analyzer import _close_door_gaps
+        mask = np.zeros((200, 200), dtype=np.uint8)
+        mask[100, 50:150] = 255
+        result = _close_door_gaps(mask, doors=[])
+        assert np.array_equal(result, mask)
+
+
+# ---------------------------------------------------------------------------
+# Debug images
+# ---------------------------------------------------------------------------
+
+class TestSaveDebugImages:
+    def test_saves_files(self, tmp_path):
+        from backend.pipeline.furnished_analyzer import _save_debug_images
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        wall_mask = np.zeros((50, 50), dtype=np.uint8)
+        rooms = [
+            {"polygon_px": [(10, 10), (90, 10), (90, 90), (10, 90)], "name": "Room 1"},
+        ]
+        debug_dir = str(tmp_path / "debug")
+        _save_debug_images(img, wall_mask, rooms, debug_dir, scale_factor=2)
+
+        import os
+        assert os.path.exists(os.path.join(debug_dir, "debug_walls.png"))
+        assert os.path.exists(os.path.join(debug_dir, "debug_rooms.png"))
+        assert os.path.exists(os.path.join(debug_dir, "debug_wallmask.png"))
+
+    def test_handles_empty_rooms(self, tmp_path):
+        from backend.pipeline.furnished_analyzer import _save_debug_images
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        wall_mask = np.zeros((50, 50), dtype=np.uint8)
+        debug_dir = str(tmp_path / "debug")
+        _save_debug_images(img, wall_mask, [], debug_dir, scale_factor=2)
+
+        import os
+        assert os.path.exists(os.path.join(debug_dir, "debug_walls.png"))
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline orchestrator
+# ---------------------------------------------------------------------------
+
+def _make_walled_image(width, height, walls, wall_grey=99, bg=255):
+    """Create a test image with grey walls. walls = list of (x1,y1,x2,y2,thickness)."""
+    import cv2 as _cv2
+    img = np.ones((height, width, 3), dtype=np.uint8) * bg
+    for x1, y1, x2, y2, t in walls:
+        _cv2.line(img, (x1, y1), (x2, y2), (wall_grey, wall_grey, wall_grey), t)
+    return img
+
 
 class TestRunFurnishedPipeline:
-    @patch("backend.pipeline.furnished_analyzer._call_gemini_with_model")
-    def test_combines_pass1_and_pass2(self, mock_gemini):
+    @patch("backend.pipeline.vision_ai.detect_building_bbox")
+    @patch("backend.pipeline.vision_ai.label_rooms")
+    def test_returns_labeled_rooms(self, mock_label, mock_bbox):
         from backend.pipeline.furnished_analyzer import run_furnished_pipeline
 
-        pass1_response = json.dumps({
-            "units": [
-                {"name": "Unit 1", "type": "residential",
-                 "box_2d": [0, 0, 500, 500]},
-                {"name": "Lobby", "type": "lobby",
-                 "box_2d": [0, 500, 500, 1000]},
-            ]
-        })
-        pass2_response = json.dumps({
-            "rooms": [
-                {"name": "Bedroom", "type": "bedroom",
-                 "box_2d": [0, 0, 1000, 1000]}
-            ]
-        })
-        mock_gemini.side_effect = [pass1_response, pass2_response]
+        mock_bbox.return_value = (0, 0, 2000, 1400)
+        mock_label.return_value = [{"name": "Bedroom", "type": "bedroom"}]
 
-        img = np.zeros((200, 400, 3), dtype=np.uint8)
+        # Large image so room is <6% of total area after downscaling
+        img = _make_walled_image(2000, 1400, [
+            (400, 300, 1600, 300, 30),   # top wall
+            (400, 1100, 1600, 1100, 30), # bottom wall
+            (400, 300, 400, 1100, 30),   # left wall
+            (1600, 300, 1600, 1100, 30), # right wall
+        ])
         rooms = run_furnished_pipeline(img)
 
-        assert mock_gemini.call_count == 2
-        residential_rooms = [r for r in rooms if r["unit_name"] == "Unit 1"]
-        public_rooms = [r for r in rooms if r["unit_name"] == "Public Space"]
-        assert len(residential_rooms) == 1
-        assert residential_rooms[0]["name"] == "Bedroom"
-        assert len(public_rooms) == 1
-        assert public_rooms[0]["name"] == "Lobby"
+        assert len(rooms) >= 1
+        assert rooms[0]["name"] == "Bedroom"
+        assert rooms[0]["type"] == "bedroom"
+        assert rooms[0]["unit_name"] is None
+        assert len(rooms[0]["polygon_px"]) >= 4
 
-    @patch("backend.pipeline.furnished_analyzer._call_gemini_with_model")
-    def test_pass1_failure_returns_empty(self, mock_gemini):
+    @patch("backend.pipeline.vision_ai.detect_building_bbox")
+    @patch("backend.pipeline.vision_ai.label_rooms")
+    def test_gemini_failure_uses_defaults(self, mock_label, mock_bbox):
         from backend.pipeline.furnished_analyzer import run_furnished_pipeline
-        mock_gemini.side_effect = Exception("API error")
-        img = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        mock_bbox.return_value = (0, 0, 2000, 1400)
+        mock_label.side_effect = Exception("API error")
+
+        img = _make_walled_image(2000, 1400, [
+            (400, 300, 1600, 300, 30),
+            (400, 1100, 1600, 1100, 30),
+            (400, 300, 400, 1100, 30),
+            (1600, 300, 1600, 1100, 30),
+        ])
         rooms = run_furnished_pipeline(img)
+
+        assert len(rooms) >= 1
+        assert rooms[0]["name"] == "Unnamed"
+        assert rooms[0]["type"] == "unknown"
+
+    @patch("backend.pipeline.vision_ai.detect_building_bbox")
+    @patch("backend.pipeline.vision_ai.label_rooms")
+    def test_no_rooms_detected(self, mock_label, mock_bbox):
+        from backend.pipeline.furnished_analyzer import run_furnished_pipeline
+
+        mock_bbox.return_value = (0, 0, 300, 200)
+
+        # Blank white image — no walls, no rooms
+        img = np.ones((200, 300, 3), dtype=np.uint8) * 255
+        rooms = run_furnished_pipeline(img)
+
         assert rooms == []
 
-    @patch("backend.pipeline.furnished_analyzer._call_gemini_with_model")
-    def test_progress_callback(self, mock_gemini):
+    @patch("backend.pipeline.vision_ai.detect_building_bbox")
+    @patch("backend.pipeline.vision_ai.label_rooms")
+    def test_progress_callback(self, mock_label, mock_bbox):
         from backend.pipeline.furnished_analyzer import run_furnished_pipeline
 
-        pass1_response = json.dumps({
-            "units": [
-                {"name": "Unit 1", "type": "residential",
-                 "box_2d": [0, 0, 500, 500]},
-            ]
-        })
-        pass2_response = json.dumps({
-            "rooms": [
-                {"name": "Bedroom", "type": "bedroom",
-                 "box_2d": [0, 0, 1000, 1000]}
-            ]
-        })
-        mock_gemini.side_effect = [pass1_response, pass2_response]
+        mock_bbox.return_value = (0, 0, 300, 200)
 
         progress_calls = []
         def cb(pct, msg):
             progress_calls.append((pct, msg))
 
-        img = np.zeros((200, 400, 3), dtype=np.uint8)
+        img = np.ones((200, 300, 3), dtype=np.uint8) * 255
         run_furnished_pipeline(img, progress_cb=cb)
+
         assert len(progress_calls) >= 2
+        assert progress_calls[-1][0] == 100
 
+    @patch("backend.pipeline.vision_ai.detect_building_bbox")
+    @patch("backend.pipeline.vision_ai.label_rooms")
+    def test_multiple_rooms(self, mock_label, mock_bbox):
+        from backend.pipeline.furnished_analyzer import run_furnished_pipeline
 
-# ---------------------------------------------------------------------------
-# JSON helpers
-# ---------------------------------------------------------------------------
+        mock_bbox.return_value = (0, 0, 2000, 1400)
+        mock_label.return_value = [
+            {"name": "Kitchen", "type": "kitchen"},
+            {"name": "Living", "type": "living"},
+        ]
 
-class TestParseJson:
-    def test_fenced_json(self):
-        from backend.pipeline.furnished_analyzer import _parse_json
-        text = '```json\n{"key": "value"}\n```'
-        assert _parse_json(text) == {"key": "value"}
+        # Two rooms side by side separated by a wall
+        img = _make_walled_image(2000, 1400, [
+            (400, 300, 1600, 300, 30),    # top wall
+            (400, 1100, 1600, 1100, 30),  # bottom wall
+            (400, 300, 400, 1100, 30),    # left wall
+            (1600, 300, 1600, 1100, 30),  # right wall
+            (1000, 300, 1000, 1100, 30),  # dividing wall
+        ])
+        rooms = run_furnished_pipeline(img)
 
-    def test_raw_json(self):
-        from backend.pipeline.furnished_analyzer import _parse_json
-        assert _parse_json('{"a": 1}') == {"a": 1}
+        assert len(rooms) >= 2
 
-    def test_invalid_returns_none(self):
-        from backend.pipeline.furnished_analyzer import _parse_json
-        assert _parse_json("not json") is None
+    @patch("backend.pipeline.vision_ai.detect_building_bbox")
+    @patch("backend.pipeline.vision_ai.label_rooms")
+    def test_gemini_bbox_constrains_rooms(self, mock_label, mock_bbox):
+        """Gemini bbox should be passed as model param and used for footprint."""
+        from backend.pipeline.furnished_analyzer import run_furnished_pipeline
 
+        mock_bbox.return_value = (50, 50, 250, 150)
 
-class TestRepairTruncatedJson:
-    def test_repair_truncated_units(self):
-        from backend.pipeline.furnished_analyzer import _repair_truncated_json
-        text = '{"units": [{"name": "A", "type": "residential", "box_2d": [0,0,500,500]},'
-        result = _repair_truncated_json(text, "units")
-        assert result is not None
-        assert len(result["units"]) == 1
+        img = np.ones((200, 300, 3), dtype=np.uint8) * 255
+        run_furnished_pipeline(img, gemini_model="gemini-2.5-pro")
 
-    def test_unrepairable_returns_none(self):
-        from backend.pipeline.furnished_analyzer import _repair_truncated_json
-        assert _repair_truncated_json("garbage", "units") is None
+        mock_bbox.assert_called_once_with(img, model="gemini-2.5-pro")

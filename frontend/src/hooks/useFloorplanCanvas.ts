@@ -35,7 +35,20 @@ export function useFloorplanCanvas({
 
   // Edit state refs
   const editHandlesRef = useRef<Circle[]>([]);
+  const midpointHandlesRef = useRef<Circle[]>([]);
   const draggingHandleRef = useRef<number>(-1);
+  const isMouseDownRef = useRef(false);
+
+  // Edge drag state: when dragging an edge midpoint, both endpoints move
+  const draggingEdgeRef = useRef<{ edgeIndex: number; startX: number; startY: number } | null>(null);
+  const edgeStartPositionsRef = useRef<{ v1: [number, number]; v2: [number, number] } | null>(null);
+
+  // Ghost polygon preview during drag
+  const ghostPolygonRef = useRef<Polygon | null>(null);
+
+  // Undo stack: stores polygon snapshots before each edit
+  const undoStackRef = useRef<number[][][]>([]);
+  const undoRoomIdRef = useRef<string | null>(null);
 
   // Store latest callback refs to avoid stale closures
   const onRoomSelectRef = useRef(onRoomSelect);
@@ -126,7 +139,7 @@ export function useFloorplanCanvas({
         return;
       }
 
-      if (canvasModeRef.current === 'edit' && draggingHandleRef.current >= 0) {
+      if (canvasModeRef.current === 'edit' && (draggingHandleRef.current >= 0 || draggingEdgeRef.current)) {
         _handleEditMouseMove(canvas, e);
         return;
       }
@@ -134,9 +147,10 @@ export function useFloorplanCanvas({
 
     canvas.on('mouse:up', () => {
       isPanning = false;
+      isMouseDownRef.current = false;
       canvas.setCursor('default');
 
-      if (canvasModeRef.current === 'edit' && draggingHandleRef.current >= 0) {
+      if (canvasModeRef.current === 'edit' && (draggingHandleRef.current >= 0 || draggingEdgeRef.current)) {
         _handleEditMouseUp(canvas);
       }
     });
@@ -163,6 +177,13 @@ export function useFloorplanCanvas({
       }
       if (e.key === 'Enter' && canvasModeRef.current === 'draw') {
         _finishDraw(canvas);
+      }
+      // Undo: Ctrl+Z (Windows/Linux) or Cmd+Z (Mac)
+      if (e.key === 'z' && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+        if (canvasModeRef.current === 'edit') {
+          e.preventDefault();
+          _handleUndo();
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -272,17 +293,63 @@ export function useFloorplanCanvas({
     canvas.requestRenderAll();
   }
 
+  // --- Undo helpers ---
+  function _saveUndoState() {
+    const roomId = selectedRoomIdRef.current;
+    if (!roomId) return;
+    // Reset stack if switching rooms
+    if (undoRoomIdRef.current !== roomId) {
+      undoStackRef.current = [];
+      undoRoomIdRef.current = roomId;
+    }
+    // Capture current polygon from handles
+    const snapshot: number[][] = editHandlesRef.current.map((h) => [
+      (h.left ?? 0) + 5, (h.top ?? 0) + 5,
+    ]);
+    undoStackRef.current.push(snapshot);
+  }
+
+  function _handleUndo() {
+    const stack = undoStackRef.current;
+    if (stack.length === 0) return;
+    const prev = stack.pop()!;
+    const roomId = selectedRoomIdRef.current;
+    if (roomId) {
+      onRoomUpdateRef.current(roomId, prev);
+    }
+  }
+
   // --- Edit mode handlers ---
   function _handleEditMouseDown(canvas: Canvas, e: any) {
-    // Check if clicking on a handle
+    isMouseDownRef.current = true;
     const target = canvas.findTarget(e.e);
+
+    // Vertex handle drag
     if (target && (target as any).data?.type === 'editHandle') {
+      _saveUndoState();
       draggingHandleRef.current = (target as any).data.vertexIndex;
       canvas.setCursor('move');
       return;
     }
 
-    // Check if clicking on a room polygon
+    // Edge midpoint handle drag — translate entire edge in parallel
+    if (target && (target as any).data?.type === 'edgeMidpoint') {
+      _saveUndoState();
+      const edgeIdx: number = (target as any).data.edgeIndex;
+      const pt = _screenToCanvas(canvas, e);
+      const handles = editHandlesRef.current;
+      const nextIdx = (edgeIdx + 1) % handles.length;
+
+      draggingEdgeRef.current = { edgeIndex: edgeIdx, startX: pt.x, startY: pt.y };
+      edgeStartPositionsRef.current = {
+        v1: [(handles[edgeIdx].left ?? 0) + 5, (handles[edgeIdx].top ?? 0) + 5],
+        v2: [(handles[nextIdx].left ?? 0) + 5, (handles[nextIdx].top ?? 0) + 5],
+      };
+      canvas.setCursor('move');
+      return;
+    }
+
+    // Click on room polygon — select it
     if (target && (target as any).data?.type === 'room') {
       onRoomSelectRef.current((target as any).data.roomId);
       return;
@@ -292,23 +359,89 @@ export function useFloorplanCanvas({
     onRoomSelectRef.current(null);
   }
 
+  function _buildGhostPoints(): { x: number; y: number }[] {
+    return editHandlesRef.current.map((h) => ({
+      x: (h.left ?? 0) + 5,
+      y: (h.top ?? 0) + 5,
+    }));
+  }
+
+  function _updateGhostPolygon(canvas: Canvas) {
+    // Remove old ghost
+    if (ghostPolygonRef.current) {
+      canvas.remove(ghostPolygonRef.current);
+      ghostPolygonRef.current = null;
+    }
+    // Draw new ghost showing the in-progress shape
+    const pts = _buildGhostPoints();
+    if (pts.length < 3) return;
+    const ghost = new Polygon(pts, {
+      fill: '#facc1510',
+      stroke: '#facc15',
+      strokeWidth: 2,
+      strokeDashArray: [6, 4],
+      selectable: false,
+      evented: false,
+      data: { type: 'ghost' },
+    });
+    canvas.add(ghost);
+    // Move ghost below handles so handles remain clickable
+    canvas.sendObjectToBack(ghost);
+    ghostPolygonRef.current = ghost;
+  }
+
   function _handleEditMouseMove(canvas: Canvas, e: any) {
-    const idx = draggingHandleRef.current;
-    if (idx < 0) return;
+    // Only drag while mouse button is held
+    if (!isMouseDownRef.current) return;
 
     const pt = _screenToCanvas(canvas, e);
+
+    // Edge drag: translate both endpoints by the same delta
+    if (draggingEdgeRef.current && edgeStartPositionsRef.current) {
+      const { edgeIndex, startX, startY } = draggingEdgeRef.current;
+      const { v1, v2 } = edgeStartPositionsRef.current;
+      const dx = pt.x - startX;
+      const dy = pt.y - startY;
+      const handles = editHandlesRef.current;
+      const nextIdx = (edgeIndex + 1) % handles.length;
+
+      handles[edgeIndex].set({ left: v1[0] + dx - 5, top: v1[1] + dy - 5 });
+      handles[edgeIndex].setCoords();
+      handles[nextIdx].set({ left: v2[0] + dx - 5, top: v2[1] + dy - 5 });
+      handles[nextIdx].setCoords();
+      _updateGhostPolygon(canvas);
+      canvas.requestRenderAll();
+      return;
+    }
+
+    // Vertex drag
+    const idx = draggingHandleRef.current;
+    if (idx < 0) return;
     const handle = editHandlesRef.current[idx];
     if (!handle) return;
 
     handle.set({ left: pt.x - 5, top: pt.y - 5 });
     handle.setCoords();
+    _updateGhostPolygon(canvas);
     canvas.requestRenderAll();
   }
 
   function _handleEditMouseUp(canvas: Canvas) {
-    const idx = draggingHandleRef.current;
-    if (idx < 0) return;
+    isMouseDownRef.current = false;
+    const isEdgeDrag = draggingEdgeRef.current !== null;
+    const isVertexDrag = draggingHandleRef.current >= 0;
+
+    // Clean up ghost polygon
+    if (ghostPolygonRef.current) {
+      canvas.remove(ghostPolygonRef.current);
+      ghostPolygonRef.current = null;
+    }
+
+    if (!isEdgeDrag && !isVertexDrag) return;
+
     draggingHandleRef.current = -1;
+    draggingEdgeRef.current = null;
+    edgeStartPositionsRef.current = null;
     canvas.setCursor('default');
 
     // Build updated polygon from handle positions
@@ -349,13 +482,15 @@ export function useFloorplanCanvas({
     const canvas = fabricRef.current;
     if (!canvas) return;
 
-    // Remove old room objects
+    // Remove old room objects and ghost polygon
     const objects = canvas.getObjects().filter((o) => {
       const t = (o as any).data?.type;
-      return t === 'room' || t === 'editHandle';
+      return t === 'room' || t === 'editHandle' || t === 'edgeMidpoint' || t === 'ghost';
     });
     objects.forEach((o) => canvas.remove(o));
     editHandlesRef.current = [];
+    midpointHandlesRef.current = [];
+    ghostPolygonRef.current = null;
 
     rooms.forEach((room, i) => {
       if (!room.boundary_polygon || room.boundary_polygon.length < 3) return;
@@ -419,6 +554,27 @@ export function useFloorplanCanvas({
           });
           canvas.add(handle);
           editHandlesRef.current.push(handle);
+        }
+
+        // Edge midpoint handles — smaller, semi-transparent
+        for (let vi = 0; vi < vertexCount; vi++) {
+          const nextVi = (vi + 1) % vertexCount;
+          const mx = (coords[vi][0] + coords[nextVi][0]) / 2;
+          const my = (coords[vi][1] + coords[nextVi][1]) / 2;
+          const mpHandle = new Circle({
+            left: mx - 3,
+            top: my - 3,
+            radius: 3,
+            fill: '#facc1580',
+            stroke: '#00000080',
+            strokeWidth: 1,
+            selectable: false,
+            evented: true,
+            hoverCursor: 'grab',
+            data: { type: 'edgeMidpoint', edgeIndex: vi },
+          });
+          canvas.add(mpHandle);
+          midpointHandlesRef.current.push(mpHandle);
         }
       }
     });
